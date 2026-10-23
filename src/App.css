@@ -1318,6 +1318,8 @@ main {
 }
 .mod-row {
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .mod-row.is-selected {
   background: #f0f5ff;
