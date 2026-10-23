@@ -7,13 +7,15 @@ PEXserver の renewal テーマを参考に、生成り色の紙・銅色の見�
 
 ## 利用方法
 
-1. Windows x64 の `PEX Mod Studio_0.1.0_x64-setup.exe` を実行するか、ポータブル EXE を起動します。
+1. Windows x64 のインストーラーを実行するか、ポータブル EXE を起動します。
 2. 「ゲームとローダー」で Minecraft の場所を確認して「ローダーを導入」を押します。
-3. 「Mod ライブラリ」の「DLL を追加」から、お持ちの **Minecraft の現在の版に対応した x64 DLL** を選択します。取り込み直後は無効です。
+3. お持ちの **Minecraft の現在の版に対応した x64 DLL** をアプリのウィンドウへドラッグ＆ドロップします。複数ファイルをまとめて追加でき、どの画面でも受け付けます。「DLL を追加」ボタンからの選択も利用できます。取り込み直後は無効です。
 4. スイッチで有効にし、「Minecraft を起動」を押します。通常の Xbox アプリやショートカットからの起動にも自動読み込みが適用されます。Mod Studio の常駐は不要です。
 5. 無効化はスイッチ、アンインストールはごみ箱ボタン。「ゲームとローダー」の「導入解除」で自動読み込み全体を解除できます。取り込み元 DLL とローカルライブラリは保持されます。
 
 Minecraft の実行中は Mod の変更を停止します。DLL は実行中にアンロードせず、変更を次回起動へ反映します。
+
+ドラッグ中は追加の可否を表示します。Minecraft 起動中・他の処理中・削除確認中は取り込みません。不正な DLL や重複ファイルは既存の検査で拒否し、複数ファイルの一部が失敗しても残りの取り込みを続けて結果を表示します。ドラッグ＆ドロップは Windows アプリで利用できます。
 
 ## 自動読み込み
 
@@ -63,6 +65,7 @@ npm run tauri dev
 
 ```powershell
 npm run build
+node --experimental-strip-types --test tests/fileDrop.test.mjs
 cargo test --manifest-path src-tauri/Cargo.toml
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-bridge.ps1
 npm run tauri build -- --bundles nsis

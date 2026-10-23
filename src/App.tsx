@@ -1,5 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { version } from "../package.json";
+import { importDllPaths, listenForFileDrops } from "./fileDrop";
 import {
   Box,
   LayoutGrid,
@@ -29,6 +32,9 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [busy, setBusy] = useState(false);
+  const working = useRef(false);
+  const dropImport = useRef<(paths: string[]) => void>(() => {});
+  const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<{ text: string; error: boolean }>();
   const [remove, setRemove] = useState<Mod>();
   const refresh = async () => {
@@ -48,6 +54,8 @@ export default function App() {
     args?: Record<string, unknown>,
     message = "変更を保存しました。",
   ) => {
+    if (working.current) return;
+    working.current = true;
     setBusy(true);
     try {
       await command(name, args);
@@ -56,9 +64,64 @@ export default function App() {
     } catch (e) {
       setNotice({ text: String(e), error: true });
     } finally {
+      working.current = false;
       setBusy(false);
     }
   };
+  const importPaths = async (paths: string[]) => {
+    if (!paths.length) return;
+    if (working.current || data?.running || remove) {
+      setNotice({
+        text: data?.running
+          ? "Minecraft を終了してから DLL を追加してください。"
+          : remove
+            ? "削除の確認画面を閉じてから DLL を追加してください。"
+            : "現在の処理が完了してから DLL を追加してください。",
+        error: true,
+      });
+      return;
+    }
+    working.current = true;
+    setBusy(true);
+    try {
+      const { count, errors } = await importDllPaths(paths, (path) =>
+        command("import_mod", { path }),
+      );
+      if (count > 0) {
+        setPage("library");
+        setQuery("");
+        setFilter("all");
+      }
+      await refresh();
+      setNotice({
+        text: `${count} 件の DLL を追加しました。${errors.join(" / ")}`,
+        error: errors.length > 0,
+      });
+    } catch (e) {
+      setNotice({ text: String(e), error: true });
+    } finally {
+      working.current = false;
+      setBusy(false);
+    }
+  };
+  useEffect(() => {
+    dropImport.current = (paths) => {
+      void importPaths(paths);
+    };
+  });
+  useEffect(() => {
+    if (!desktop) return;
+    return listenForFileDrops(
+      (handler) => getCurrentWebview().onDragDropEvent(handler),
+      setDragging,
+      (paths) => dropImport.current(paths),
+      (error) =>
+        setNotice({
+          text: `ドラッグ＆ドロップを準備できませんでした。「DLL を追加」から選択できます。${String(error)}`,
+          error: true,
+        }),
+    );
+  }, []);
   const add = async () => {
     if (!desktop) {
       setNotice({
@@ -67,34 +130,22 @@ export default function App() {
       });
       return;
     }
+    if (working.current) return;
+    working.current = true;
+    setBusy(true);
+    let files: string | string[] | null = null;
     try {
-      const files = await open({
+      files = await open({
         multiple: true,
         filters: [{ name: "Windows DLL", extensions: ["dll"] }],
       });
-      if (files) {
-        setBusy(true);
-        let count = 0;
-        const errors: string[] = [];
-        for (const path of Array.isArray(files) ? files : [files]) {
-          try {
-            await command("import_mod", { path });
-            count++;
-          } catch (e) {
-            errors.push(String(e));
-          }
-        }
-        await refresh();
-        setNotice({
-          text: `${count} 件の DLL を追加しました。${errors.join(" / ")}`,
-          error: errors.length > 0,
-        });
-      }
     } catch (e) {
       setNotice({ text: String(e), error: true });
     } finally {
+      working.current = false;
       setBusy(false);
     }
+    if (files) await importPaths(Array.isArray(files) ? files : [files]);
   };
   const choose = async () => {
     try {
@@ -126,7 +177,43 @@ export default function App() {
     { id: "logs" as const, label: "読み込みログ", icon: FileText },
   ];
   return (
-    <div className="app-shell">
+    <div
+      className="app-shell"
+      onDragOver={(event) => event.preventDefault()}
+      onDrop={(event) => {
+        event.preventDefault();
+        if (!desktop)
+          setNotice({
+            text: "ドラッグ＆ドロップは Windows アプリで利用できます。",
+            error: true,
+          });
+      }}
+    >
+      {dragging && (
+        <div
+          className={`file-drop-overlay ${locked || remove ? "blocked" : ""}`}
+          role="status"
+          aria-live="polite"
+        >
+          <div className="file-drop-card">
+            <Download size={40} strokeWidth={1.5} />
+            <h2>
+              {data?.running
+                ? "Minecraft を終了してから追加してください"
+                : busy
+                  ? "現在の処理が完了するまでお待ちください"
+                  : remove
+                    ? "削除の確認画面を閉じてください"
+                    : "ここに DLL をドロップ"}
+            </h2>
+            <p>
+              {locked || remove
+                ? "この状態ではファイルを追加しません。"
+                : "複数の DLL をまとめて追加できます。追加後は無効で登録されます。"}
+            </p>
+          </div>
+        </div>
+      )}
       <aside className="sidebar">
         <button className="brand" onClick={() => setPage("library")}>
           <span className="brand-mark">
@@ -177,7 +264,7 @@ export default function App() {
           </button>
           <div className="sidebar-footer">
             <span className="status-dot" />
-            LOCAL WORKSPACE <span>v0.1.0</span>
+            LOCAL WORKSPACE <span>v{version}</span>
           </div>
         </div>
       </aside>
@@ -395,6 +482,10 @@ export default function App() {
                     />
                   </label>
                 </div>
+                <p className="drop-hint">
+                  DLL
+                  をこのウィンドウにドラッグ＆ドロップして追加できます（複数選択可）。
+                </p>
                 {shown.length ? (
                   <div className="mod-list">
                     {shown.map((m) => (
@@ -460,7 +551,7 @@ export default function App() {
                     <p>
                       {mods.length
                         ? "検索やフィルターを変更してください。"
-                        : "お持ちの x64 DLL を追加して、ライブラリを作りましょう。"}
+                        : "お持ちの x64 DLL をこのウィンドウにドロップしてください。"}
                       <br />
                       {!mods.length &&
                         "追加した Mod は、確認してから有効にできます。"}
@@ -475,7 +566,7 @@ export default function App() {
                         DLL ファイルを選択
                       </button>
                     )}
-                    <small>.DLL FILES · x64 ARCHITECTURE</small>
+                    <small>DRAG & DROP · .DLL FILES · x64</small>
                   </div>
                 )}
               </section>
@@ -647,7 +738,7 @@ export default function App() {
                 [
                   "02",
                   "DLL を追加して、有効にする",
-                  "「DLL を追加」から x64 DLL を選び、スイッチで有効にします。追加直後は無効です。削除はごみ箱ボタンから行えます。",
+                  "x64 DLL をウィンドウにドラッグ＆ドロップするか、「DLL を追加」から選びます。複数ファイルをまとめて追加できます。追加直後は無効で、スイッチで有効にします。",
                 ],
                 [
                   "03",

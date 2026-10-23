@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PEX Mod Studio",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "com.pexserver.modstudio",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -13,6 +13,7 @@
     "windows": [
       {
         "title": "PEX Mod Studio",
+        "dragDropEnabled": true,
         "width": 1240,
         "height": 840,
         "minWidth": 860,
