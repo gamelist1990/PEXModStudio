@@ -22,6 +22,13 @@ pub struct Mod {
     pub size: u64,
     pub enabled: bool,
 }
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImportOutcome {
+    Added,
+    Updated,
+    Unchanged,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Library {
@@ -211,7 +218,12 @@ impl ManagerState {
         write(g.join("PEXMods/active.txt"), manifest.as_bytes())
     }
     fn commit(&self, current: &mut Library, next: Library) -> Result<()> {
-        self.deploy(&next)?;
+        if let Err(e) = self.deploy(&next) {
+            return match self.deploy(current) {
+                Ok(()) => Err(e),
+                Err(restore) => Err(format!("{e} / 元の配置の復元にも失敗しました: {restore}")),
+            };
+        }
         if let Err(e) = self.save(&next) {
             let _ = self.deploy(current);
             return Err(e);
@@ -281,10 +293,10 @@ pub fn set_game_path(path: String, state: tauri::State<ManagerState>) -> Result<
     Ok(())
 }
 #[tauri::command]
-pub fn import_mod(path: String, state: tauri::State<ManagerState>) -> Result<()> {
+pub fn import_mod(path: String, state: tauri::State<ManagerState>) -> Result<ImportOutcome> {
     import_mod_inner(path, &state)
 }
-fn import_mod_inner(path: String, state: &ManagerState) -> Result<()> {
+fn import_mod_inner(path: String, state: &ManagerState) -> Result<ImportOutcome> {
     stopped()?;
     let mut lib = state.library.lock().map_err(err)?;
     let p = Path::new(&path);
@@ -294,9 +306,6 @@ fn import_mod_inner(path: String, state: &ManagerState) -> Result<()> {
     let bytes = read(p)?;
     pe_x64(&bytes)?;
     let sha256 = hash(&bytes);
-    if lib.mods.iter().any(|m| m.sha256 == sha256) {
-        return Err("同じ DLL がすでに追加されています。".into());
-    }
     let filename = p
         .file_name()
         .ok_or("Invalid filename")?
@@ -304,6 +313,87 @@ fn import_mod_inner(path: String, state: &ManagerState) -> Result<()> {
         .into_owned();
     if filename.contains(['\n', '\r', ':', '/', '\\']) {
         return Err("DLL のファイル名が不正です。".into());
+    }
+    let matches: Vec<usize> = lib
+        .mods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.filename.eq_ignore_ascii_case(&filename))
+        .map(|(i, _)| i)
+        .collect();
+    if matches.len() > 1 {
+        return Err(format!(
+            "同名の {filename} が複数登録されています。不要な項目を削除してから更新してください。"
+        ));
+    }
+    if let Some(&index) = matches.first() {
+        let old = lib.mods[index].clone();
+        if old.sha256 == sha256 {
+            return Ok(ImportOutcome::Unchanged);
+        }
+        // Keep the UUID, filename casing, name and enabled state stable across updates.
+        let target = state.root.join("library").join(&old.id).join(&old.filename);
+        let original = optional_read(&target)?;
+        let deployed = if Path::new(&lib.game_path).join(MARKER).exists() {
+            let g = game(&lib)?;
+            verify_owned(&g, &owned(&g)?)?;
+            Some(g.join("PEXMods").join(&old.id).join(&old.filename))
+        } else {
+            None
+        };
+        let deployed_original = deployed
+            .as_ref()
+            .map(|p| optional_read(p))
+            .transpose()?
+            .flatten();
+        let recovery = if deployed.is_some() {
+            recovery_edits(Path::new(&lib.game_path), std::slice::from_ref(&old.id))?
+        } else {
+            vec![]
+        };
+        let mut next = lib.clone();
+        next.mods[index].sha256 = sha256;
+        next.mods[index].size = bytes.len() as u64;
+        fs::create_dir_all(target.parent().unwrap()).map_err(err)?;
+        write(&target, &bytes)?;
+        let result = (|| {
+            // Refresh an existing disabled deployment too; never create one just for a disabled mod.
+            if let Some(p) = &deployed {
+                if deployed_original.is_some() {
+                    write(p, &bytes)?;
+                }
+            }
+            state.deploy(&next)?;
+            apply_recovery(&recovery)?;
+            state.save(&next)
+        })();
+        if let Err(error) = result {
+            let mut failures = vec![];
+            if let Err(e) = restore_recovery(&recovery) {
+                failures.push(e);
+            }
+            if let Err(e) = restore_file(&target, original.as_deref()) {
+                failures.push(e);
+            }
+            if let Some(p) = &deployed {
+                if let Err(e) = restore_file(p, deployed_original.as_deref()) {
+                    failures.push(e);
+                }
+            }
+            if let Err(e) = state.deploy(&lib) {
+                failures.push(e);
+            }
+            return Err(if failures.is_empty() {
+                error
+            } else {
+                format!("{error} / 復元エラー: {}", failures.join(" / "))
+            });
+        }
+        *lib = next;
+        return Ok(ImportOutcome::Updated);
+    }
+    if lib.mods.iter().any(|m| m.sha256 == sha256) {
+        return Err("同じ内容の DLL が別の名前ですでに追加されています。".into());
     }
     let id = Uuid::new_v4().to_string();
     let dir = state.root.join("library").join(&id);
@@ -322,35 +412,138 @@ fn import_mod_inner(path: String, state: &ManagerState) -> Result<()> {
         let _ = fs::remove_dir_all(dir);
         return Err(e);
     }
+    Ok(ImportOutcome::Added)
+}
+fn optional_read(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(err(e)),
+    }
+}
+fn restore_file(path: &Path, bytes: Option<&[u8]>) -> Result<()> {
+    if let Some(bytes) = bytes {
+        write(path, bytes)
+    } else {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(err(e)),
+        }
+    }
+}
+struct RecoveryEdit {
+    path: PathBuf,
+    original: Vec<u8>,
+    replacement: Vec<u8>,
+}
+fn recovery_edits(game: &Path, ids: &[String]) -> Result<Vec<RecoveryEdit>> {
+    let mut edits = vec![];
+    for name in ["blocked.txt", "loading.txt"] {
+        let path = game.join("PEXMods").join(name);
+        if let Some(original) = optional_read(&path)? {
+            let text = String::from_utf8_lossy(&original);
+            let matches = |line: &str| ids.iter().any(|id| line.starts_with(&format!("{id}/")));
+            if text.lines().any(matches) {
+                let replacement = text
+                    .lines()
+                    .filter(|line| !matches(line))
+                    .map(|line| format!("{line}\n"))
+                    .collect::<String>()
+                    .into_bytes();
+                edits.push(RecoveryEdit {
+                    path,
+                    original,
+                    replacement,
+                });
+            }
+        }
+    }
+    Ok(edits)
+}
+fn restore_recovery(edits: &[RecoveryEdit]) -> Result<()> {
+    let errors: Vec<_> = edits
+        .iter()
+        .filter_map(|edit| write(&edit.path, &edit.original).err())
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join(" / "))
+    }
+}
+fn apply_recovery(edits: &[RecoveryEdit]) -> Result<()> {
+    for edit in edits {
+        if let Err(e) = restore_file(
+            &edit.path,
+            if edit.replacement.is_empty() {
+                None
+            } else {
+                Some(&edit.replacement)
+            },
+        ) {
+            return match restore_recovery(edits) {
+                Ok(()) => Err(e),
+                Err(r) => Err(format!("{e} / 回復情報の復元失敗: {r}")),
+            };
+        }
+    }
     Ok(())
+}
+fn selected_mods(lib: &Library, ids: &[String]) -> Result<Vec<Mod>> {
+    let ids: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+    if ids.is_empty() {
+        return Err("Mod を選択してください。".into());
+    }
+    let mods: Vec<_> = lib
+        .mods
+        .iter()
+        .filter(|m| ids.contains(m.id.as_str()))
+        .cloned()
+        .collect();
+    if mods.len() != ids.len() {
+        return Err("選択した Mod が見つかりません。状態を更新して選び直してください。".into());
+    }
+    Ok(mods)
 }
 #[tauri::command]
 pub fn set_enabled(id: String, enabled: bool, state: tauri::State<ManagerState>) -> Result<()> {
     set_enabled_inner(id, enabled, &state)
 }
 fn set_enabled_inner(id: String, enabled: bool, state: &ManagerState) -> Result<()> {
+    set_mods_enabled_inner(vec![id], enabled, state)
+}
+#[tauri::command]
+pub fn set_mods_enabled(
+    ids: Vec<String>,
+    enabled: bool,
+    state: tauri::State<ManagerState>,
+) -> Result<()> {
+    set_mods_enabled_inner(ids, enabled, &state)
+}
+fn set_mods_enabled_inner(ids: Vec<String>, enabled: bool, state: &ManagerState) -> Result<()> {
     stopped()?;
     let mut lib = state.library.lock().map_err(err)?;
+    let selected = selected_mods(&lib, &ids)?;
     let mut next = lib.clone();
-    next.mods
-        .iter_mut()
-        .find(|m| m.id == id)
-        .ok_or("Mod が見つかりません。")?
-        .enabled = enabled;
-    state.commit(&mut lib, next)?;
-    if enabled {
-        if let Ok(g) = game(&lib) {
-            let p = g.join("PEXMods/blocked.txt");
-            if p.exists() {
-                let old = fs::read_to_string(&p).map_err(err)?;
-                let text: String = old
-                    .lines()
-                    .filter(|s| !s.starts_with(&format!("{id}/")))
-                    .map(|s| format!("{s}\n"))
-                    .collect();
-                write(p, text.as_bytes())?;
-            }
+    for m in &mut next.mods {
+        if selected.iter().any(|s| s.id == m.id) {
+            m.enabled = enabled;
         }
+    }
+    let recovery = if enabled && Path::new(&lib.game_path).join(MARKER).exists() {
+        let g = game(&lib)?;
+        verify_owned(&g, &owned(&g)?)?;
+        recovery_edits(&g, &ids)?
+    } else {
+        vec![]
+    };
+    apply_recovery(&recovery)?;
+    if let Err(e) = state.commit(&mut lib, next) {
+        return match restore_recovery(&recovery) {
+            Ok(()) => Err(e),
+            Err(r) => Err(format!("{e} / 回復情報の復元失敗: {r}")),
+        };
     }
     Ok(())
 }
@@ -359,26 +552,40 @@ pub fn remove_mod(id: String, state: tauri::State<ManagerState>) -> Result<()> {
     remove_mod_inner(id, &state)
 }
 fn remove_mod_inner(id: String, state: &ManagerState) -> Result<()> {
+    remove_mods_inner(vec![id], state)
+}
+#[tauri::command]
+pub fn remove_mods(ids: Vec<String>, state: tauri::State<ManagerState>) -> Result<()> {
+    remove_mods_inner(ids, &state)
+}
+fn remove_mods_inner(ids: Vec<String>, state: &ManagerState) -> Result<()> {
     stopped()?;
     let mut lib = state.library.lock().map_err(err)?;
-    let m = lib
-        .mods
-        .iter()
-        .find(|m| m.id == id)
-        .ok_or("Mod が見つかりません。")?
-        .clone();
+    let selected = selected_mods(&lib, &ids)?;
     let mut next = lib.clone();
-    next.mods.retain(|m| m.id != id);
+    next.mods.retain(|m| !selected.iter().any(|s| s.id == m.id));
     state.commit(&mut lib, next)?;
-    let dir = state.root.join("library").join(&m.id);
-    fs::remove_file(dir.join(&m.filename)).map_err(err)?;
-    fs::remove_dir(&dir).map_err(err)?;
-    if let Ok(g) = game(&lib) {
-        let dir = g.join("PEXMods").join(&m.id);
-        if dir.exists() {
-            fs::remove_file(dir.join(&m.filename)).map_err(err)?;
-            fs::remove_dir(dir).map_err(err)?;
+    let mut errors = vec![];
+    for m in selected {
+        let mut dirs = vec![state.root.join("library").join(&m.id)];
+        if let Ok(g) = game(&lib) {
+            dirs.push(g.join("PEXMods").join(&m.id));
         }
+        for dir in dirs {
+            if dir.exists() {
+                if let Err(e) = restore_file(&dir.join(&m.filename), None) {
+                    errors.push(format!("{}: {e}", m.filename));
+                }
+                // Preserve unknown companion files instead of recursively deleting them.
+                let _ = fs::remove_dir(&dir);
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "選択した Mod は解除済みですが、一部のコピーを削除できませんでした: {}",
+            errors.join(" / ")
+        ));
     }
     Ok(())
 }
@@ -607,7 +814,10 @@ mod tests {
         install_loader_inner(&s).unwrap();
         assert!(g.join("winhttp.dll").is_file());
         import_mod_inner(source.display().to_string(), &s).unwrap();
-        assert!(import_mod_inner(source.display().to_string(), &s).is_err());
+        assert_eq!(
+            import_mod_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Unchanged
+        );
         let id = s.library.lock().unwrap().mods[0].id.clone();
         assert!(fs::read_to_string(g.join("PEXMods/active.txt"))
             .unwrap()
@@ -659,5 +869,199 @@ mod tests {
             }],
         };
         assert!(validate_library(&lib).is_err());
+    }
+    #[test]
+    fn same_filename_update_preserves_identity_and_enabled_state() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let source = d.path().join("Example.dll");
+        fs::write(&source, BRIDGE).unwrap();
+        assert_eq!(
+            import_mod_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Added
+        );
+        let original = s.library.lock().unwrap().mods[0].clone();
+        set_enabled_inner(original.id.clone(), true, &s).unwrap();
+        let mut newer = BRIDGE.to_vec();
+        newer.extend_from_slice(b"new version");
+        let updated = d.path().join("EXAMPLE.DLL");
+        fs::write(&updated, &newer).unwrap();
+        assert_eq!(
+            import_mod_inner(updated.display().to_string(), &s).unwrap(),
+            ImportOutcome::Updated
+        );
+        let lib = s.library.lock().unwrap();
+        assert_eq!(lib.mods.len(), 1);
+        let m = &lib.mods[0];
+        assert_eq!(m.id, original.id);
+        assert!(m.enabled);
+        assert_eq!(m.filename, "Example.dll");
+        assert_eq!(m.sha256, hash(&newer));
+        assert_eq!(m.size, newer.len() as u64);
+        assert_eq!(
+            read(s.root.join("library").join(&m.id).join(&m.filename)).unwrap(),
+            newer
+        );
+        assert_eq!(
+            read(g.join("PEXMods").join(&m.id).join(&m.filename)).unwrap(),
+            newer
+        );
+    }
+    #[test]
+    fn disabled_update_stays_disabled_and_identical_import_is_a_noop() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let source = d.path().join("mod.dll");
+        fs::write(&source, BRIDGE).unwrap();
+        import_mod_inner(source.display().to_string(), &s).unwrap();
+        let id = s.library.lock().unwrap().mods[0].id.clone();
+        set_enabled_inner(id.clone(), true, &s).unwrap();
+        set_enabled_inner(id.clone(), false, &s).unwrap();
+        let mut newer = BRIDGE.to_vec();
+        newer.push(1);
+        fs::write(&source, &newer).unwrap();
+        assert_eq!(
+            import_mod_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Updated
+        );
+        assert!(!s.library.lock().unwrap().mods[0].enabled);
+        assert!(read(g.join("PEXMods/active.txt")).unwrap().is_empty());
+        assert_eq!(
+            read(g.join("PEXMods").join(&id).join("mod.dll")).unwrap(),
+            newer
+        );
+        assert_eq!(
+            import_mod_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Unchanged
+        );
+    }
+    #[test]
+    fn failed_update_restores_library_and_deployed_bytes() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let source = d.path().join("mod.dll");
+        fs::write(&source, BRIDGE).unwrap();
+        import_mod_inner(source.display().to_string(), &s).unwrap();
+        let id = s.library.lock().unwrap().mods[0].id.clone();
+        set_enabled_inner(id.clone(), true, &s).unwrap();
+        fs::remove_file(s.root.join("library.json")).unwrap();
+        fs::create_dir(s.root.join("library.json")).unwrap();
+        let mut newer = BRIDGE.to_vec();
+        newer.push(2);
+        fs::write(&source, newer).unwrap();
+        assert!(import_mod_inner(source.display().to_string(), &s).is_err());
+        assert_eq!(
+            read(s.root.join("library").join(&id).join("mod.dll")).unwrap(),
+            BRIDGE
+        );
+        assert_eq!(
+            read(g.join("PEXMods").join(&id).join("mod.dll")).unwrap(),
+            BRIDGE
+        );
+        assert_eq!(s.library.lock().unwrap().mods[0].sha256, hash(BRIDGE));
+    }
+    #[test]
+    fn invalid_update_does_not_replace_existing_mod() {
+        let (d, s, _g) = fixture();
+        let source = d.path().join("mod.dll");
+        fs::write(&source, BRIDGE).unwrap();
+        import_mod_inner(source.display().to_string(), &s).unwrap();
+        fs::write(&source, b"invalid").unwrap();
+        assert!(import_mod_inner(source.display().to_string(), &s).is_err());
+        let lib = s.library.lock().unwrap();
+        assert_eq!(lib.mods.len(), 1);
+        assert_eq!(lib.mods[0].sha256, hash(BRIDGE));
+    }
+    #[test]
+    fn updated_and_reenabled_mods_clear_only_their_recovery_records() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let source = d.path().join("mod.dll");
+        fs::write(&source, BRIDGE).unwrap();
+        import_mod_inner(source.display().to_string(), &s).unwrap();
+        let id = s.library.lock().unwrap().mods[0].id.clone();
+        let block = format!("{id}/mod.dll\nother/mod.dll\n");
+        let loading = format!("{id}/mod.dll");
+        fs::write(g.join("PEXMods/blocked.txt"), &block).unwrap();
+        fs::write(g.join("PEXMods/loading.txt"), &loading).unwrap();
+        let mut newer = BRIDGE.to_vec();
+        newer.push(5);
+        fs::write(&source, &newer).unwrap();
+        import_mod_inner(source.display().to_string(), &s).unwrap();
+        assert_eq!(
+            fs::read_to_string(g.join("PEXMods/blocked.txt")).unwrap(),
+            "other/mod.dll\n"
+        );
+        assert!(!g.join("PEXMods/loading.txt").exists());
+        fs::write(g.join("PEXMods/blocked.txt"), &block).unwrap();
+        fs::write(g.join("PEXMods/loading.txt"), &loading).unwrap();
+        set_enabled_inner(id.clone(), true, &s).unwrap();
+        assert_eq!(
+            fs::read_to_string(g.join("PEXMods/blocked.txt")).unwrap(),
+            "other/mod.dll\n"
+        );
+        assert!(!g.join("PEXMods/loading.txt").exists());
+        fs::write(g.join("PEXMods/blocked.txt"), &block).unwrap();
+        fs::write(g.join("PEXMods/loading.txt"), &loading).unwrap();
+        fs::remove_file(s.root.join("library.json")).unwrap();
+        fs::create_dir(s.root.join("library.json")).unwrap();
+        newer.push(6);
+        fs::write(&source, newer).unwrap();
+        assert!(import_mod_inner(source.display().to_string(), &s).is_err());
+        assert_eq!(
+            fs::read_to_string(g.join("PEXMods/blocked.txt")).unwrap(),
+            block
+        );
+        assert_eq!(
+            fs::read_to_string(g.join("PEXMods/loading.txt")).unwrap(),
+            loading
+        );
+    }
+    #[test]
+    fn bulk_changes_validate_ids_and_affect_selected_items_only() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        for i in 0..3 {
+            let source = d.path().join(format!("mod{i}.dll"));
+            let mut bytes = BRIDGE.to_vec();
+            bytes.push(i);
+            fs::write(&source, bytes).unwrap();
+            import_mod_inner(source.display().to_string(), &s).unwrap();
+        }
+        let ids: Vec<_> = s
+            .library
+            .lock()
+            .unwrap()
+            .mods
+            .iter()
+            .map(|m| m.id.clone())
+            .collect();
+        assert!(set_mods_enabled_inner(vec![ids[0].clone(), "missing".into()], true, &s).is_err());
+        assert!(s.library.lock().unwrap().mods.iter().all(|m| !m.enabled));
+        set_mods_enabled_inner(ids[..2].to_vec(), true, &s).unwrap();
+        {
+            let lib = s.library.lock().unwrap();
+            assert!(lib.mods[0].enabled && lib.mods[1].enabled && !lib.mods[2].enabled);
+        }
+        assert_eq!(
+            fs::read_to_string(g.join("PEXMods/active.txt"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        set_mods_enabled_inner(ids[..2].to_vec(), false, &s).unwrap();
+        assert!(read(g.join("PEXMods/active.txt")).unwrap().is_empty());
+        assert!(remove_mods_inner(vec![ids[0].clone(), "missing".into()], &s).is_err());
+        assert_eq!(s.library.lock().unwrap().mods.len(), 3);
+        remove_mods_inner(ids[..2].to_vec(), &s).unwrap();
+        let lib = s.library.lock().unwrap();
+        assert_eq!(lib.mods.len(), 1);
+        assert_eq!(lib.mods[0].id, ids[2]);
+        for id in &ids[..2] {
+            assert!(!s.root.join("library").join(id).exists());
+            assert!(!g.join("PEXMods").join(id).exists());
+        }
+        assert!(d.path().join("mod0.dll").exists());
     }
 }

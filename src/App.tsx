@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { version } from "../package.json";
 import { importDllPaths, listenForFileDrops } from "./fileDrop";
+import { toggleModSelection, toggleVisibleSelection } from "./selection";
 import {
   Box,
   LayoutGrid,
@@ -36,7 +37,10 @@ export default function App() {
   const dropImport = useRef<(paths: string[]) => void>(() => {});
   const [dragging, setDragging] = useState(false);
   const [notice, setNotice] = useState<{ text: string; error: boolean }>();
-  const [remove, setRemove] = useState<Mod>();
+  const [remove, setRemove] = useState<Mod[]>();
+  const [selection, setSelection] = useState<Set<string>>(() => new Set());
+  const selectionAnchor = useRef<string | undefined>(undefined);
+  const selectAllBox = useRef<HTMLInputElement>(null);
   const refresh = async () => {
     try {
       setData(await getSnapshot());
@@ -54,15 +58,17 @@ export default function App() {
     args?: Record<string, unknown>,
     message = "変更を保存しました。",
   ) => {
-    if (working.current) return;
+    if (working.current) return false;
     working.current = true;
     setBusy(true);
     try {
       await command(name, args);
       await refresh();
       setNotice({ text: message, error: false });
+      return true;
     } catch (e) {
       setNotice({ text: String(e), error: true });
+      return false;
     } finally {
       working.current = false;
       setBusy(false);
@@ -84,17 +90,18 @@ export default function App() {
     working.current = true;
     setBusy(true);
     try {
-      const { count, errors } = await importDllPaths(paths, (path) =>
-        command("import_mod", { path }),
+      const { count, updated, unchanged, errors } = await importDllPaths(
+        paths,
+        (path) => command("import_mod", { path }),
       );
-      if (count > 0) {
+      if (count + updated + unchanged > 0) {
         setPage("library");
         setQuery("");
         setFilter("all");
       }
       await refresh();
       setNotice({
-        text: `${count} 件の DLL を追加しました。${errors.join(" / ")}`,
+        text: `${count} 件追加・${updated} 件更新・${unchanged} 件変更なし。${errors.join(" / ")}`,
         error: errors.length > 0,
       });
     } catch (e) {
@@ -171,6 +178,33 @@ export default function App() {
       m.name.toLowerCase().includes(query.toLowerCase()) &&
       (filter === "all" || (filter === "enabled" ? m.enabled : !m.enabled)),
   );
+  const visibleIds = shown.map((mod) => mod.id);
+  const selectedMods = mods.filter((mod) => selection.has(mod.id));
+  const visibleSelected = shown.filter((mod) => selection.has(mod.id)).length;
+  const allVisibleSelected =
+    shown.length > 0 && visibleSelected === shown.length;
+  useEffect(() => {
+    if (selectAllBox.current)
+      selectAllBox.current.indeterminate =
+        visibleSelected > 0 && !allVisibleSelected;
+  }, [visibleSelected, allVisibleSelected, page]);
+  const selectMod = (id: string, range: boolean) => {
+    setSelection((current) =>
+      toggleModSelection(
+        current,
+        id,
+        visibleIds,
+        selectionAnchor.current,
+        range,
+      ),
+    );
+    if (
+      !range ||
+      !selectionAnchor.current ||
+      !visibleIds.includes(selectionAnchor.current)
+    )
+      selectionAnchor.current = id;
+  };
   const nav = [
     { id: "library" as const, label: "Mod ライブラリ", icon: LayoutGrid },
     { id: "setup" as const, label: "ゲームとローダー", icon: Settings2 },
@@ -486,10 +520,127 @@ export default function App() {
                   DLL
                   をこのウィンドウにドラッグ＆ドロップして追加できます（複数選択可）。
                 </p>
+                {mods.length > 0 && (
+                  <div
+                    className={`selection-toolbar ${selectedMods.length ? "has-selection" : ""}`}
+                    aria-label="Mod の一括操作"
+                  >
+                    <label className="select-all">
+                      <input
+                        ref={selectAllBox}
+                        type="checkbox"
+                        checked={allVisibleSelected}
+                        disabled={!shown.length || busy}
+                        onChange={() =>
+                          setSelection((current) =>
+                            toggleVisibleSelection(current, visibleIds),
+                          )
+                        }
+                      />
+                      表示中を全選択
+                    </label>
+                    <span
+                      className="selection-count"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {selectedMods.length} 件選択
+                      {selectedMods.length > visibleSelected
+                        ? `（うち非表示 ${selectedMods.length - visibleSelected} 件）`
+                        : ""}
+                    </span>
+                    <div className="bulk-actions">
+                      <button
+                        className="secondary"
+                        disabled={locked || !selectedMods.length}
+                        onClick={() =>
+                          void action(
+                            "set_mods_enabled",
+                            {
+                              ids: selectedMods.map((mod) => mod.id),
+                              enabled: true,
+                            },
+                            `${selectedMods.length} 件を有効にしました。次回起動に反映されます。`,
+                          )
+                        }
+                      >
+                        <Power size={14} />
+                        有効化
+                      </button>
+                      <button
+                        className="secondary"
+                        disabled={locked || !selectedMods.length}
+                        onClick={() =>
+                          void action(
+                            "set_mods_enabled",
+                            {
+                              ids: selectedMods.map((mod) => mod.id),
+                              enabled: false,
+                            },
+                            `${selectedMods.length} 件を無効にしました。次回起動に反映されます。`,
+                          )
+                        }
+                      >
+                        無効化
+                      </button>
+                      <button
+                        className="secondary danger"
+                        disabled={locked || !selectedMods.length}
+                        onClick={() => setRemove(selectedMods)}
+                      >
+                        <Trash2 size={14} />
+                        削除
+                      </button>
+                      <button
+                        className="text-button"
+                        disabled={!selectedMods.length || busy}
+                        onClick={() => {
+                          setSelection(new Set());
+                          selectionAnchor.current = undefined;
+                        }}
+                      >
+                        選択解除
+                      </button>
+                    </div>
+                  </div>
+                )}
+                {mods.length > 0 && (
+                  <p className="selection-help">
+                    行をクリックして選択 · Shift＋クリックで範囲選択 · Space
+                    キーでチェック切り替え
+                  </p>
+                )}
                 {shown.length ? (
                   <div className="mod-list">
                     {shown.map((m) => (
-                      <article className="mod-row" key={m.id}>
+                      <article
+                        className={`mod-row ${selection.has(m.id) ? "is-selected" : ""}`}
+                        key={m.id}
+                        onClick={(event) => {
+                          if (
+                            !(event.target as HTMLElement).closest(
+                              "button,input,label,a",
+                            ) &&
+                            !busy
+                          )
+                            selectMod(m.id, event.shiftKey);
+                        }}
+                      >
+                        <label className="mod-checkbox">
+                          <input
+                            type="checkbox"
+                            aria-label={`${m.name} を選択`}
+                            checked={selection.has(m.id)}
+                            disabled={busy}
+                            onChange={(event) =>
+                              selectMod(
+                                m.id,
+                                (event.nativeEvent as MouseEvent).shiftKey ===
+                                  true,
+                              )
+                            }
+                          />
+                        </label>
                         <span className={`mod-icon ${m.enabled ? "on" : ""}`}>
                           <Box size={24} />
                         </span>
@@ -530,7 +681,7 @@ export default function App() {
                           className="icon-button delete"
                           aria-label={`${m.name} を削除`}
                           disabled={locked}
-                          onClick={() => setRemove(m)}
+                          onClick={() => setRemove([m])}
                         >
                           <Trash2 size={17} />
                         </button>
@@ -793,10 +944,18 @@ export default function App() {
             }}
           >
             <Trash2 size={26} />
-            <h2 id="delete-title">この Mod を削除しますか？</h2>
+            <h2 id="delete-title">
+              {remove.length > 1
+                ? `選択した ${remove.length} 件の Mod を削除しますか？`
+                : "この Mod を削除しますか？"}
+            </h2>
             <p>
-              {remove.name} をライブラリとゲーム側から削除します。元の DLL
-              は保持されます。
+              {remove
+                .slice(0, 3)
+                .map((mod) => mod.name)
+                .join("、")}
+              {remove.length > 3 ? ` ほか ${remove.length - 3} 件` : ""}{" "}
+              をライブラリとゲーム側から削除します。元の DLL は保持されます。
             </p>
             <div className="button-row">
               <button
@@ -808,13 +967,22 @@ export default function App() {
               </button>
               <button
                 className="primary danger-fill"
-                onClick={() => {
-                  void action(
-                    "remove_mod",
-                    { id: remove.id },
-                    "Mod を削除しました。",
-                  );
+                onClick={async () => {
+                  const ids = remove.map((mod) => mod.id);
                   setRemove(undefined);
+                  if (
+                    await action(
+                      "remove_mods",
+                      { ids },
+                      `${ids.length} 件の Mod を削除しました。`,
+                    )
+                  ) {
+                    setSelection(
+                      (current) =>
+                        new Set([...current].filter((id) => !ids.includes(id))),
+                    );
+                    selectionAnchor.current = undefined;
+                  }
                 }}
               >
                 削除する

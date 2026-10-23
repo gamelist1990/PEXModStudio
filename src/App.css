@@ -1254,3 +1254,83 @@ main {
   font-size: 11px;
   line-height: 1.8;
 }
+.selection-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel);
+}
+.selection-toolbar.has-selection {
+  background: var(--soft);
+  border-color: #a8c7fa;
+}
+.select-all {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 36px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.mod-checkbox {
+  display: grid;
+  place-items: center;
+  padding: 8px 2px;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.select-all input,
+.mod-checkbox input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--brand);
+  cursor: pointer;
+}
+.selection-count {
+  font-size: 11px;
+  color: var(--muted);
+}
+.bulk-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-left: auto;
+}
+.bulk-actions .secondary {
+  min-height: 36px;
+  padding: 7px 11px;
+}
+.bulk-actions .text-button {
+  margin-left: 0;
+}
+.selection-help {
+  font-size: 10px;
+  color: var(--muted);
+  line-height: 1.8;
+  margin-top: 9px;
+}
+.mod-row {
+  cursor: pointer;
+}
+.mod-row.is-selected {
+  background: #f0f5ff;
+  border-color: #8db5f2;
+  box-shadow: inset 3px 0 0 var(--brand);
+}
+.mod-row:has(input:focus-visible) {
+  outline: 2px solid var(--brand);
+  outline-offset: 2px;
+}
+@media (max-width: 900px) {
+  .bulk-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+}

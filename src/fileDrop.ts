@@ -38,16 +38,25 @@ export function listenForFileDrops(
 export async function importDllPaths(
   paths: string[],
   importFile: (path: string) => Promise<unknown>,
-): Promise<{ count: number; errors: string[] }> {
+): Promise<{
+  count: number;
+  updated: number;
+  unchanged: number;
+  errors: string[];
+}> {
   let count = 0;
+  let updated = 0;
+  let unchanged = 0;
   const errors: string[] = [];
   for (const path of paths) {
     try {
-      await importFile(path);
-      count++;
+      const outcome = await importFile(path);
+      if (outcome === "updated") updated++;
+      else if (outcome === "unchanged") unchanged++;
+      else count++;
     } catch (error) {
       errors.push(`${path.split(/[\\/]/).pop()}: ${String(error)}`);
     }
   }
-  return { count, errors };
+  return { count, updated, unchanged, errors };
 }

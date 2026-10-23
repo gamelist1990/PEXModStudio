@@ -108,6 +108,24 @@ test("mixed files import sequentially and continue after invalid or duplicate DL
 test("empty drops import no files", async () => {
   assert.deepEqual(await importDllPaths([], assert.fail), {
     count: 0,
+    updated: 0,
+    unchanged: 0,
     errors: [],
   });
+});
+test("new files, updates and identical files are counted separately", async () => {
+  const statuses = {
+    "new.dll": "added",
+    "update.dll": "updated",
+    "same.dll": "unchanged",
+  };
+  assert.deepEqual(
+    await importDllPaths(Object.keys(statuses), async (path) => statuses[path]),
+    {
+      count: 1,
+      updated: 1,
+      unchanged: 1,
+      errors: [],
+    },
+  );
 });
