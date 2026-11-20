@@ -656,6 +656,10 @@ main {
   color: #2e664c;
   background: #e5efdf;
 }
+.mod-badge.kind {
+  color: #4a5a8a;
+  background: #e8edf9;
+}
 .mod-info p,
 .mod-info code {
   font-size: 10px;
@@ -667,6 +671,12 @@ main {
 .mod-info code {
   font-size: 9px;
   color: #8b847a;
+}
+.mod-description {
+  font-size: 10px;
+  color: #5c5b60;
+  margin-top: 7px;
+  line-height: 1.5;
 }
 .switch {
   border: 0;
@@ -694,6 +704,10 @@ main {
 .delete:hover {
   color: #a32f29;
   background: #f8e6df;
+}
+.export:hover {
+  color: var(--brand);
+  background: #e7edf9;
 }
 .bottom-note {
   display: flex;

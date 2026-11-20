@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { version } from "../package.json";
 import { importDllPaths, listenForFileDrops } from "./fileDrop";
@@ -24,7 +24,15 @@ import {
   Power,
   CircleHelp,
 } from "lucide-react";
-import { command, desktop, getSnapshot, type Snapshot, type Mod } from "./api";
+import {
+  command,
+  desktop,
+  exportModsPackage,
+  getSnapshot,
+  importModsPackage,
+  type Snapshot,
+  type Mod,
+} from "./api";
 import "./App.css";
 type Page = "library" | "setup" | "logs" | "guide";
 export default function App() {
@@ -79,10 +87,10 @@ export default function App() {
     if (working.current || data?.running || remove) {
       setNotice({
         text: data?.running
-          ? "Minecraft を終了してから DLL を追加してください。"
+          ? "Minecraft を終了してから Mod を追加してください。"
           : remove
-            ? "削除の確認画面を閉じてから DLL を追加してください。"
-            : "現在の処理が完了してから DLL を追加してください。",
+            ? "削除の確認画面を閉じてから Mod を追加してください。"
+            : "現在の処理が完了してから Mod を追加してください。",
         error: true,
       });
       return;
@@ -90,19 +98,43 @@ export default function App() {
     working.current = true;
     setBusy(true);
     try {
+      const dllPaths = paths.filter((p) =>
+        p.toLowerCase().endsWith(".dll"),
+      );
+      const modsPaths = paths.filter((p) =>
+        p.toLowerCase().endsWith(".mods"),
+      );
       const { count, updated, unchanged, errors } = await importDllPaths(
-        paths,
+        dllPaths,
         (path) => command("import_mod", { path }),
       );
-      if (count + updated + unchanged > 0) {
+      let tsCount = 0;
+      let tsUpdated = 0;
+      let tsUnchanged = 0;
+      const tsErrors: string[] = [];
+      for (const path of modsPaths) {
+        try {
+          const outcome = await importModsPackage(path);
+          if (outcome === "updated") tsUpdated++;
+          else if (outcome === "unchanged") tsUnchanged++;
+          else tsCount++;
+        } catch (error) {
+          tsErrors.push(`${path.split(/[\\/]/).pop()}: ${String(error)}`);
+        }
+      }
+      if (count + updated + unchanged + tsCount + tsUpdated + tsUnchanged > 0) {
         setPage("library");
         setQuery("");
         setFilter("all");
       }
       await refresh();
+      const totalCount = count + tsCount;
+      const totalUpdated = updated + tsUpdated;
+      const totalUnchanged = unchanged + tsUnchanged;
+      const totalErrors = [...errors, ...tsErrors];
       setNotice({
-        text: `${count} 件追加・${updated} 件更新・${unchanged} 件変更なし。${errors.join(" / ")}`,
-        error: errors.length > 0,
+        text: `${totalCount} 件追加・${totalUpdated} 件更新・${totalUnchanged} 件変更なし。${totalErrors.join(" / ")}`,
+        error: totalErrors.length > 0,
       });
     } catch (e) {
       setNotice({ text: String(e), error: true });
@@ -129,7 +161,7 @@ export default function App() {
         }),
     );
   }, []);
-  const add = async () => {
+  const addDll = async () => {
     if (!desktop) {
       setNotice({
         text: "DLL の追加は Windows アプリで利用できます。",
@@ -153,6 +185,67 @@ export default function App() {
       setBusy(false);
     }
     if (files) await importPaths(Array.isArray(files) ? files : [files]);
+  };
+
+  const addMods = async () => {
+    if (!desktop) {
+      setNotice({
+        text: ".mods の追加は Windows アプリで利用できます。",
+        error: true,
+      });
+      return;
+    }
+    if (working.current) return;
+    working.current = true;
+    setBusy(true);
+    let files: string | string[] | null = null;
+    try {
+      files = await open({
+        multiple: true,
+        filters: [{ name: "PEX Mod Package", extensions: ["mods"] }],
+      });
+    } catch (e) {
+      setNotice({ text: String(e), error: true });
+    } finally {
+      working.current = false;
+      setBusy(false);
+    }
+    if (files) await importPaths(Array.isArray(files) ? files : [files]);
+  };
+  const exportMods = async (m: Mod) => {
+    if (!desktop) {
+      setNotice({
+        text: ".mods の書き出しは Windows アプリで利用できます。",
+        error: true,
+      });
+      return;
+    }
+    if (working.current) return;
+    let destination: string | null = null;
+    try {
+      destination = await save({
+        defaultPath: `${m.name}.mods`,
+        filters: [{ name: "PEX Mod Package", extensions: ["mods"] }],
+      });
+    } catch (e) {
+      setNotice({ text: String(e), error: true });
+      return;
+    }
+    if (!destination) return;
+    working.current = true;
+    setBusy(true);
+    try {
+      await exportModsPackage(m.id, destination);
+      setNotice({
+        text: `${m.name} を ${destination.split(/[\\/]/).pop()} に書き出しました。`,
+        error: false,
+      });
+    } catch (e) {
+      setNotice({ text: String(e), error: true });
+    } finally {
+      working.current = false;
+      setBusy(false);
+    }
   };
   const choose = async () => {
     try {
@@ -238,12 +331,12 @@ export default function App() {
                   ? "現在の処理が完了するまでお待ちください"
                   : remove
                     ? "削除の確認画面を閉じてください"
-                    : "ここに DLL をドロップ"}
+                    : "ここに Mod をドロップ"}
             </h2>
             <p>
               {locked || remove
                 ? "この状態ではファイルを追加しません。"
-                : "複数の DLL をまとめて追加できます。追加後は無効で登録されます。"}
+                : ".dll と .mods をまとめて追加できます。追加後は無効で登録されます。"}
             </p>
           </div>
         </div>
@@ -476,14 +569,24 @@ export default function App() {
                       Mod ライブラリ <span>{mods.length}</span>
                     </h2>
                   </div>
-                  <button
-                    className="primary"
-                    disabled={locked}
-                    onClick={() => void add()}
-                  >
-                    <Plus size={18} />
-                    DLL を追加
-                  </button>
+                  <div className="button-row">
+                    <button
+                      className="primary"
+                      disabled={locked}
+                      onClick={() => void addDll()}
+                    >
+                      <Plus size={18} />
+                      DLL を追加
+                    </button>
+                    <button
+                      className="secondary"
+                      disabled={locked}
+                      onClick={() => void addMods()}
+                    >
+                      <Plus size={18} />
+                      .mods を追加
+                    </button>
+                  </div>
                 </div>
                 <div className="library-toolbar">
                   <div
@@ -517,7 +620,7 @@ export default function App() {
                   </label>
                 </div>
                 <p className="drop-hint">
-                  DLL
+                  .dll または .mods
                   をこのウィンドウにドラッグ＆ドロップして追加できます（複数選択可）。
                 </p>
                 {mods.length > 0 && (
@@ -652,14 +755,28 @@ export default function App() {
                             >
                               {m.enabled ? "有効" : "無効"}
                             </span>
+                            <span className="mod-badge kind">
+                              {m.kind === "ts" ? "TS Mod" : "x64 DLL"}
+                            </span>
                           </h3>
                           <p>
-                            {m.filename} · {(m.size / 1024 / 1024).toFixed(2)}{" "}
-                            MB · x64 DLL
+                            {m.kind === "ts" && m.manifest
+                              ? `v${m.manifest.version} · API ${m.manifest.apiVersion}`
+                              : `${m.filename}`}
+                            {" · "}
+                            {(m.size / 1024 / 1024).toFixed(2)} MB
+                            {m.kind === "ts" && m.manifest
+                              ? ` · entry: ${m.manifest.entry} · 対応: ${m.manifest.gameVersions.length ? m.manifest.gameVersions.join(", ") : "*"}`
+                              : " · x64 DLL"}
                           </p>
                           <code title={m.sha256}>
                             SHA-256 {m.sha256.slice(0, 16)}…
                           </code>
+                          {m.kind === "ts" && m.manifest?.description && (
+                            <p className="mod-description">
+                              {m.manifest.description}
+                            </p>
+                          )}
                         </div>
                         <button
                           className="switch"
@@ -677,6 +794,17 @@ export default function App() {
                         >
                           <span />
                         </button>
+                        {m.kind === "ts" && (
+                          <button
+                            className="icon-button export"
+                            aria-label={`${m.name} を .mods として書き出す`}
+                            title=".mods として書き出す"
+                            disabled={locked}
+                            onClick={() => void exportMods(m)}
+                          >
+                            <Download size={17} />
+                          </button>
+                        )}
                         <button
                           className="icon-button delete"
                           aria-label={`${m.name} を削除`}
@@ -711,13 +839,13 @@ export default function App() {
                       <button
                         className="secondary"
                         disabled={locked}
-                        onClick={() => void add()}
+                        onClick={() => void addDll()}
                       >
                         <Plus size={17} />
                         DLL ファイルを選択
                       </button>
                     )}
-                    <small>DRAG & DROP · .DLL FILES · x64</small>
+                    <small>DRAG & DROP · .DLL / .MODS FILES</small>
                   </div>
                 )}
               </section>
@@ -841,6 +969,20 @@ export default function App() {
                     onClick={() =>
                       void action(
                         "open_folder",
+                        { kind: "mods" },
+                        "mods フォルダを開きました。",
+                      )
+                    }
+                  >
+                    <FolderOpen size={17} />
+                    mods フォルダを開く
+                  </button>
+                  <button
+                    className="secondary"
+                    disabled={!data?.detected}
+                    onClick={() =>
+                      void action(
+                        "open_folder",
                         { kind: "game" },
                         "ゲームフォルダを開きました。",
                       )
@@ -888,8 +1030,8 @@ export default function App() {
                 ],
                 [
                   "02",
-                  "DLL を追加して、有効にする",
-                  "x64 DLL をウィンドウにドラッグ＆ドロップするか、「DLL を追加」から選びます。複数ファイルをまとめて追加できます。追加直後は無効で、スイッチで有効にします。",
+                  "DLL または .mods を追加して、有効にする",
+                  "x64 DLL または .mods パッケージをウィンドウにドラッグ＆ドロップするか、ボタンから選びます。複数ファイルをまとめて追加できます。追加直後は無効で、スイッチで有効にします。",
                 ],
                 [
                   "03",
@@ -913,7 +1055,9 @@ export default function App() {
                   専用プラグインは依存環境が別途必要です。読み込み成功はゲームとの互換性を保証するものではありません。
                 </p>
                 <p>
-                  この版は単体 DLL に対応します。追加データや依存 DLL が必要な
+                  この版は単体 DLL と .mods 形式の TS Mod に対応します。TS Mod
+                  は有効化するとゲームの <code>mods/&lt;Mod名&gt;/</code> に展開されます。ScriptClient.dll
+                  を DLL Mod として登録している場合は、その配置フォルダ直下の <code>mods/</code> に展開されます。追加データや依存 DLL が必要な
                   Mod は、配布元の構成への対応が必要です。初期化中に終了した DLL
                   は、次の起動でスキップしてログに記録します。ゲーム内でクラッシュする場合は、該当する
                   Mod を無効にしてください。
@@ -955,7 +1099,7 @@ export default function App() {
                 .map((mod) => mod.name)
                 .join("、")}
               {remove.length > 3 ? ` ほか ${remove.length - 3} 件` : ""}{" "}
-              をライブラリとゲーム側から削除します。元の DLL は保持されます。
+              をライブラリとゲーム側から削除します。元のファイルは保持されます。
             </p>
             <div className="button-row">
               <button

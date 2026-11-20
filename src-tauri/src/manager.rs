@@ -12,6 +12,34 @@ const MARKER: &str = ".pex-mod-studio.json";
 const PROXY: &[u8] = include_bytes!("../resources/winhttp.dll");
 const BRIDGE: &[u8] = include_bytes!("../resources/PEXModBridge.asi");
 const CONFIG: &[u8] = b"[GlobalSets]\r\nLoadPlugins=1\r\nDontLoadFromDllMain=1\r\nLoadFromScriptsOnly=1\r\nLoadRecursively=0\r\nLoadExtraPlugins=PEXMods\\PEXModBridge.asi\r\nDebugLog=1\r\n";
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModKind {
+    Dll,
+    Ts,
+}
+
+impl Default for ModKind {
+    fn default() -> Self {
+        ModKind::Dll
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TsManifest {
+    pub name: String,
+    pub version: String,
+    pub api_version: String,
+    pub entry: String,
+    #[serde(default)]
+    pub game_versions: Vec<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub author: String,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Mod {
@@ -21,6 +49,10 @@ pub struct Mod {
     pub sha256: String,
     pub size: u64,
     pub enabled: bool,
+    #[serde(default)]
+    pub kind: ModKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<TsManifest>,
 }
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -76,6 +108,24 @@ fn write(path: impl AsRef<Path>, bytes: &[u8]) -> Result<()> {
     temp.persist(path).map_err(err)?;
     Ok(())
 }
+
+fn copy_dir(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
+    let src = src.as_ref();
+    let dst = dst.as_ref();
+    fs::create_dir_all(dst).map_err(err)?;
+    for entry in fs::read_dir(src).map_err(err)? {
+        let entry = entry.map_err(err)?;
+        let path = entry.path();
+        let name = entry.file_name();
+        let target = dst.join(&name);
+        if path.is_dir() {
+            copy_dir(&path, &target)?;
+        } else {
+            write(&target, &read(&path)?)?;
+        }
+    }
+    Ok(())
+}
 fn pe_x64(bytes: &[u8]) -> Result<()> {
     if bytes.len() < 64 || &bytes[..2] != b"MZ" {
         return Err("Windows DLL（PE形式）ではありません。".into());
@@ -123,6 +173,20 @@ fn game(lib: &Library) -> Result<PathBuf> {
     }
     Ok(path)
 }
+/// Stage B ホスト（ScriptClient.dll）は自身の配置ディレクトリ直下の `mods/` を走査する
+/// (`mod_scanner.cpp` の `resolveModsDir`)。Studio が ScriptClient.dll を扱う経路は DLL Mod
+/// としての import のみで、その配置先は `Content/PEXMods/<id>/` である。ホストが登録されて
+/// いる場合はその直下の `mods/` に TS Mod を配置し、それ以外は従来どおり `Content/mods/`
+/// を使う（Content 直下に注入されたホストにも対応）。
+fn ts_mods_dir(lib: &Library, game: &Path) -> PathBuf {
+    lib.mods
+        .iter()
+        .find(|m| {
+            m.kind == ModKind::Dll && m.filename.eq_ignore_ascii_case("ScriptClient.dll")
+        })
+        .map(|m| game.join("PEXMods").join(&m.id).join("mods"))
+        .unwrap_or_else(|| game.join("mods"))
+}
 fn owned(game: &Path) -> Result<Owned> {
     serde_json::from_slice(&read(game.join(MARKER))?).map_err(err)
 }
@@ -162,14 +226,30 @@ fn validate_library(lib: &Library) -> Result<()> {
         if Uuid::parse_str(&m.id).is_err()
             || !ids.insert(&m.id)
             || m.filename.contains(['/', '\\', ':', '\n', '\r'])
-            || !m.filename.to_lowercase().ends_with(".dll")
-            || m.filename == ".dll"
             || m.sha256.len() != 64
             || !m.sha256.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return Err(
                 "Mod ライブラリの管理情報が不正です。library.json を確認してください。".into(),
             );
+        }
+        match m.kind {
+            ModKind::Dll => {
+                if !m.filename.to_lowercase().ends_with(".dll") || m.filename == ".dll" {
+                    return Err(
+                        "Mod ライブラリの管理情報が不正です。library.json を確認してください。"
+                            .into(),
+                    );
+                }
+            }
+            ModKind::Ts => {
+                if m.manifest.is_none() {
+                    return Err(
+                        "TS Mod の管理情報に manifest が不足しています。library.json を確認してください。"
+                            .into(),
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -204,16 +284,39 @@ impl ManagerState {
         }
         let g = game(lib)?;
         verify_owned(&g, &owned(&g)?)?;
+        let ts_dir = ts_mods_dir(lib, &g);
+        // ホストは配置先フォルダを直接走査するため、無効化された TS Mod の
+        // フォルダが残ると無効なままロードされてしまう。必ず有効なものだけ残す。
+        for m in lib.mods.iter().filter(|m| m.kind == ModKind::Ts && !m.enabled) {
+            let stale = ts_dir.join(&m.name);
+            if stale.exists() {
+                fs::remove_dir_all(&stale).map_err(err)?;
+            }
+        }
         let mut manifest = String::new();
         for m in lib.mods.iter().filter(|m| m.enabled) {
-            let bytes = read(self.root.join("library").join(&m.id).join(&m.filename))?;
-            if hash(&bytes) != m.sha256 {
-                return Err(format!("{} の SHA-256 が一致しません。", m.name));
+            match m.kind {
+                ModKind::Dll => {
+                    let bytes = read(self.root.join("library").join(&m.id).join(&m.filename))?;
+                    if hash(&bytes) != m.sha256 {
+                        return Err(format!("{} の SHA-256 が一致しません。", m.name));
+                    }
+                    let dir = g.join("PEXMods").join(&m.id);
+                    fs::create_dir_all(&dir).map_err(err)?;
+                    write(dir.join(&m.filename), &bytes)?;
+                    manifest.push_str(&format!("{}/{}\n", m.id, m.filename));
+                }
+                ModKind::Ts => {
+                    let source = self.root.join("library").join(&m.id);
+                    let target = ts_dir.join(&m.name);
+                    // 更新時に古いファイルが残らないよう、配置先を作り直す。
+                    if target.exists() {
+                        fs::remove_dir_all(&target).map_err(err)?;
+                    }
+                    fs::create_dir_all(&target).map_err(err)?;
+                    copy_dir(&source, &target)?;
+                }
             }
-            let dir = g.join("PEXMods").join(&m.id);
-            fs::create_dir_all(&dir).map_err(err)?;
-            write(dir.join(&m.filename), &bytes)?;
-            manifest.push_str(&format!("{}/{}\n", m.id, m.filename));
         }
         write(g.join("PEXMods/active.txt"), manifest.as_bytes())
     }
@@ -292,6 +395,91 @@ pub fn set_game_path(path: String, state: tauri::State<ManagerState>) -> Result<
     *lib = next;
     Ok(())
 }
+fn read_manifest_from_zip(path: &Path) -> Result<(TsManifest, Vec<u8>, String)> {
+    let file = fs::File::open(path).map_err(err)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(err)?;
+
+    // Accept either root-level manifest.json or a single top-level folder containing manifest.json.
+    let root_manifest = archive.file_names().any(|n| n == "manifest.json");
+    let prefix = if root_manifest {
+        String::new()
+    } else {
+        let prefixes: std::collections::HashSet<String> = archive
+            .file_names()
+            .filter(|n| n.contains('/'))
+            .filter_map(|n| n.split('/').next().map(str::to_owned))
+            .collect();
+        if prefixes.len() != 1 {
+            return Err(
+                ".mods ファイルの構造が不正です。manifest.json をルート、または1つのフォルダに入れてください。"
+                    .into(),
+            );
+        }
+        let p = prefixes.into_iter().next().unwrap();
+        if !archive.file_names().any(|n| n == format!("{}/manifest.json", p)) {
+            return Err("manifest.json が見つかりません。.mods ファイルを確認してください。".into());
+        }
+        format!("{}/", p)
+    };
+
+    let mut manifest_file = archive
+        .by_name(&format!("{}manifest.json", prefix))
+        .map_err(|_| "manifest.json を開けませんでした。".to_string())?;
+    let mut manifest_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut manifest_file, &mut manifest_bytes).map_err(err)?;
+    drop(manifest_file);
+
+    let manifest: TsManifest = serde_json::from_slice(&manifest_bytes).map_err(err)?;
+    if manifest.name.trim().is_empty()
+        || manifest.version.trim().is_empty()
+        || manifest.api_version.trim().is_empty()
+        || manifest.entry.trim().is_empty()
+    {
+        return Err(
+            "manifest.json に必須項目（name / version / apiVersion / entry）が不足しています。"
+                .into(),
+        );
+    }
+    if manifest.name.contains(['/', '\\', ':', '\n', '\r']) {
+        return Err("Mod 名に使用できない文字が含まれています。".into());
+    }
+    Ok((manifest, manifest_bytes, prefix))
+}
+
+fn extract_mods_package(path: &Path, dest: &Path, prefix: &str) -> Result<(u64, String)> {
+    fs::create_dir_all(dest).map_err(err)?;
+    let file = fs::File::open(path).map_err(err)?;
+    let mut archive = zip::ZipArchive::new(file).map_err(err)?;
+    let prefix_len = prefix.len();
+
+    let mut hasher = Sha256::new();
+    let mut total_size: u64 = 0;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(err)?;
+        if file.is_dir() {
+            continue;
+        }
+        // Own the name before mutably borrowing `file` for decompression.
+        let name = file.name().to_string();
+        if prefix_len > 0 && !name.starts_with(prefix) {
+            continue;
+        }
+        let relative = name[prefix_len.min(name.len())..].to_string();
+        let mut buffer = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut buffer).map_err(err)?;
+        hasher.update(&buffer);
+        total_size += buffer.len() as u64;
+        if !relative.is_empty() {
+            let out_path = dest.join(&relative);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).map_err(err)?;
+            }
+            write(&out_path, &buffer)?;
+        }
+    }
+    Ok((total_size, format!("{:x}", hasher.finalize())))
+}
+
 #[tauri::command]
 pub fn import_mod(path: String, state: tauri::State<ManagerState>) -> Result<ImportOutcome> {
     import_mod_inner(path, &state)
@@ -407,6 +595,8 @@ fn import_mod_inner(path: String, state: &ManagerState) -> Result<ImportOutcome>
         sha256,
         size: bytes.len() as u64,
         enabled: false,
+        kind: ModKind::Dll,
+        manifest: None,
     });
     if let Err(e) = state.commit(&mut lib, next) {
         let _ = fs::remove_dir_all(dir);
@@ -414,6 +604,165 @@ fn import_mod_inner(path: String, state: &ManagerState) -> Result<ImportOutcome>
     }
     Ok(ImportOutcome::Added)
 }
+
+#[tauri::command]
+pub fn import_mods_package(
+    path: String,
+    state: tauri::State<ManagerState>,
+) -> Result<ImportOutcome> {
+    import_mods_package_inner(path, &state)
+}
+
+fn import_mods_package_inner(path: String, state: &ManagerState) -> Result<ImportOutcome> {
+    stopped()?;
+    let p = Path::new(&path);
+    if !p.extension().is_some_and(|x| x.eq_ignore_ascii_case("mods")) {
+        return Err(".mods ファイルを選択してください。".into());
+    }
+    let (manifest, manifest_bytes, prefix) = read_manifest_from_zip(p)?;
+    let package_name = manifest.name.clone();
+
+    let mut lib = state.library.lock().map_err(err)?;
+    let matches: Vec<usize> = lib
+        .mods
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.kind == ModKind::Ts && m.name == package_name)
+        .map(|(i, _)| i)
+        .collect();
+    if matches.len() > 1 {
+        return Err(format!(
+            "同名の TS Mod \"{package_name}\" が複数登録されています。不要な項目を削除してから更新してください。"
+        ));
+    }
+
+    let dir = if let Some(&index) = matches.first() {
+        state.root.join("library").join(&lib.mods[index].id)
+    } else {
+        state.root.join("library").join(Uuid::new_v4().to_string())
+    };
+    if dir.exists() {
+        let _ = fs::remove_dir_all(&dir);
+    }
+    fs::create_dir(&dir).map_err(err)?;
+    let (size, file_hash) = extract_mods_package(p, &dir, &prefix)?;
+    let mut integrity = Sha256::new();
+    integrity.update(&manifest_bytes);
+    integrity.update(file_hash.as_bytes());
+    let package_hash = format!("{:x}", integrity.finalize());
+
+    if let Some(&index) = matches.first() {
+        let old = lib.mods[index].clone();
+        if old.sha256 == package_hash {
+            return Ok(ImportOutcome::Unchanged);
+        }
+        let mut next = lib.clone();
+        next.mods[index].sha256 = package_hash;
+        next.mods[index].size = size;
+        next.mods[index].manifest = Some(manifest);
+        let result = state.commit(&mut lib, next);
+        if let Err(error) = result {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+        return Ok(ImportOutcome::Updated);
+    }
+
+    if lib.mods.iter().any(|m| m.kind == ModKind::Ts && m.sha256 == package_hash) {
+        let _ = fs::remove_dir_all(&dir);
+        return Err("同じ内容の .mods パッケージが別の名前ですでに追加されています。".into());
+    }
+
+    let id = dir.file_name().unwrap().to_string_lossy().into_owned();
+    let mut next = lib.clone();
+    next.mods.push(Mod {
+        id,
+        name: package_name,
+        filename: String::new(),
+        sha256: package_hash,
+        size,
+        enabled: false,
+        kind: ModKind::Ts,
+        manifest: Some(manifest),
+    });
+    if let Err(e) = state.commit(&mut lib, next) {
+        let _ = fs::remove_dir_all(dir);
+        return Err(e);
+    }
+    Ok(ImportOutcome::Added)
+}
+
+#[tauri::command]
+pub fn export_mods_package(
+    id: String,
+    path: String,
+    state: tauri::State<ManagerState>,
+) -> Result<()> {
+    export_mods_package_inner(id, path, &state)
+}
+
+/// ライブラリ内の TS Mod を `.mods`（zip）として書き出す。
+/// manifest.json はフォルダ直下に置き、取り込み側がそのまま再 import できる形にする。
+fn export_mods_package_inner(id: String, path: String, state: &ManagerState) -> Result<()> {
+    let lib = state.library.lock().map_err(err)?;
+    let m = lib
+        .mods
+        .iter()
+        .find(|m| m.id == id && m.kind == ModKind::Ts)
+        .ok_or("書き出す TS Mod が見つかりません。")?;
+    let source = state.root.join("library").join(&m.id);
+    let manifest_path = source.join("manifest.json");
+    if !manifest_path.is_file() {
+        return Err("manifest.json が見つかりません。".into());
+    }
+    let target = Path::new(&path);
+    if !target
+        .extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("mods"))
+    {
+        return Err("書き出し先は .mods ファイルを指定してください。".into());
+    }
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temp = tempfile::NamedTempFile::new_in(parent).map_err(err)?;
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut archive = zip::ZipWriter::new(temp);
+    archive.start_file("manifest.json", options).map_err(err)?;
+    std::io::Write::write_all(&mut archive, &read(&manifest_path)?).map_err(err)?;
+    add_dir_to_zip(&mut archive, &source, "", options)?;
+    let temp = archive.finish().map_err(err)?;
+    temp.persist(target).map_err(err)?;
+    Ok(())
+}
+
+fn add_dir_to_zip<W: std::io::Write + std::io::Seek>(
+    archive: &mut zip::ZipWriter<W>,
+    dir: &Path,
+    prefix: &str,
+    options: zip::write::SimpleFileOptions,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(err)? {
+        let entry = entry.map_err(err)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let relative = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            add_dir_to_zip(archive, &path, &relative, options)?;
+        } else if relative != "manifest.json" {
+            archive.start_file(&relative, options).map_err(err)?;
+            std::io::Write::write_all(archive, &read(&path)?).map_err(err)?;
+        }
+    }
+    Ok(())
+}
+
 fn optional_read(path: &Path) -> Result<Option<Vec<u8>>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -564,20 +913,34 @@ fn remove_mods_inner(ids: Vec<String>, state: &ManagerState) -> Result<()> {
     let selected = selected_mods(&lib, &ids)?;
     let mut next = lib.clone();
     next.mods.retain(|m| !selected.iter().any(|s| s.id == m.id));
+    // ホスト DLL と TS Mod を同時削除しても配置先を解決できるよう、commit 前に計算する。
+    let game_dirs = game(&lib)
+        .ok()
+        .map(|g| (g.clone(), ts_mods_dir(&lib, &g)));
     state.commit(&mut lib, next)?;
     let mut errors = vec![];
     for m in selected {
         let mut dirs = vec![state.root.join("library").join(&m.id)];
-        if let Ok(g) = game(&lib) {
-            dirs.push(g.join("PEXMods").join(&m.id));
+        if let Some((g, ts_dir)) = &game_dirs {
+            match m.kind {
+                ModKind::Dll => dirs.push(g.join("PEXMods").join(&m.id)),
+                ModKind::Ts => dirs.push(ts_dir.join(&m.name)),
+            }
         }
         for dir in dirs {
             if dir.exists() {
-                if let Err(e) = restore_file(&dir.join(&m.filename), None) {
-                    errors.push(format!("{}: {e}", m.filename));
+                match m.kind {
+                    ModKind::Dll => {
+                        if let Err(e) = restore_file(&dir.join(&m.filename), None) {
+                            errors.push(format!("{}: {e}", m.filename));
+                        }
+                        // Preserve unknown companion files instead of recursively deleting them.
+                        let _ = fs::remove_dir(&dir);
+                    }
+                    ModKind::Ts => {
+                        let _ = fs::remove_dir_all(&dir);
+                    }
                 }
-                // Preserve unknown companion files instead of recursively deleting them.
-                let _ = fs::remove_dir(&dir);
             }
         }
     }
@@ -739,6 +1102,10 @@ pub fn open_folder(kind: String, state: tauri::State<ManagerState>) -> Result<()
     let lib = state.library.lock().map_err(err)?;
     let p = match kind.as_str() {
         "library" => state.root.join("library"),
+        "mods" => {
+            let g = game(&lib)?;
+            ts_mods_dir(&lib, &g)
+        }
         "game" => game(&lib)?,
         _ => return Err("Unknown folder".into()),
     };
@@ -866,6 +1233,8 @@ mod tests {
                 sha256: "0".repeat(64),
                 size: 0,
                 enabled: false,
+                kind: ModKind::Dll,
+                manifest: None,
             }],
         };
         assert!(validate_library(&lib).is_err());
@@ -1063,5 +1432,243 @@ mod tests {
             assert!(!g.join("PEXMods").join(id).exists());
         }
         assert!(d.path().join("mod0.dll").exists());
+    }
+
+    fn create_mods_package(path: &Path, folder: Option<&str>, manifest: &str, files: &[(&str, &[u8])]) {
+        use std::io::Write;
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        let prefix = folder.map(|f| format!("{}/", f)).unwrap_or_default();
+        zip.start_file(format!("{}manifest.json", prefix), options)
+            .unwrap();
+        zip.write_all(manifest.as_bytes()).unwrap();
+        for (name, bytes) in files {
+            zip.start_file(format!("{}{}", prefix, name), options)
+                .unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn imports_mods_package_root_level() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let source = d.path().join("EffectFake.mods");
+        create_mods_package(
+            &source,
+            None,
+            r#"{"name":"EffectFake","version":"1.0.0","apiVersion":"0.1","entry":"src/index.ts","description":"Fake effects client-side"}"#,
+            &[("src/index.ts", b"console.log('effect fake');")],
+        );
+        assert_eq!(
+            import_mods_package_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Added
+        );
+        let lib = s.library.lock().unwrap();
+        assert_eq!(lib.mods.len(), 1);
+        assert_eq!(lib.mods[0].name, "EffectFake");
+        assert_eq!(lib.mods[0].kind, ModKind::Ts);
+        assert!(lib.mods[0].manifest.is_some());
+        drop(lib);
+        let id = s.library.lock().unwrap().mods[0].id.clone();
+        set_enabled_inner(id, true, &s).unwrap();
+        assert!(g.join("mods/EffectFake/manifest.json").is_file());
+        assert_eq!(
+            read(g.join("mods/EffectFake/src/index.ts")).unwrap(),
+            b"console.log('effect fake');"
+        );
+    }
+
+    #[test]
+    fn imports_mods_package_with_top_level_folder() {
+        let (d, s, _g) = fixture();
+        let source = d.path().join("EffectFake.mods");
+        create_mods_package(
+            &source,
+            Some("EffectFake"),
+            r#"{"name":"EffectFake","version":"1.0.0","apiVersion":"0.1","entry":"src/index.ts"}"#,
+            &[("src/index.ts", b"export {};")],
+        );
+        assert_eq!(
+            import_mods_package_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Added
+        );
+        let lib = s.library.lock().unwrap();
+        assert_eq!(lib.mods[0].name, "EffectFake");
+        assert!(s.root.join("library").join(&lib.mods[0].id).join("src/index.ts").is_file());
+    }
+
+    #[test]
+    fn rejects_invalid_mods_package() {
+        let (d, s, _g) = fixture();
+        let source = d.path().join("bad.mods");
+        create_mods_package(
+            &source,
+            None,
+            r#"{"name":"Bad","version":"1.0.0"}"#,
+            &[],
+        );
+        assert!(import_mods_package_inner(source.display().to_string(), &s).is_err());
+    }
+
+    #[test]
+    fn updates_same_name_mods_package() {
+        let (d, s, _g) = fixture();
+        let source = d.path().join("EffectFake.mods");
+        create_mods_package(
+            &source,
+            None,
+            r#"{"name":"EffectFake","version":"1.0.0","apiVersion":"0.1","entry":"src/index.ts"}"#,
+            &[("src/index.ts", b"v1")],
+        );
+        import_mods_package_inner(source.display().to_string(), &s).unwrap();
+        create_mods_package(
+            &source,
+            None,
+            r#"{"name":"EffectFake","version":"2.0.0","apiVersion":"0.1","entry":"src/index.ts"}"#,
+            &[("src/index.ts", b"v2")],
+        );
+        assert_eq!(
+            import_mods_package_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Updated
+        );
+        let lib = s.library.lock().unwrap();
+        assert_eq!(lib.mods[0].manifest.as_ref().unwrap().version, "2.0.0");
+        assert_eq!(
+            read(s.root.join("library").join(&lib.mods[0].id).join("src/index.ts")).unwrap(),
+            b"v2"
+        );
+    }
+
+    // 実物 ~/WorkSpace/ts-mods/EffectFake/manifest.json と同じ値。
+    // apiVersion 1.0.0 / gameVersions 1.26.65.1 は Stage B ホストが受理する組み合わせ。
+    const EFFECTFAKE_MANIFEST: &str = r#"{"apiVersion":"1.0.0","description":"クライアント側だけでポーション効果を付ける Mod。サーバーには一切送られない。","entry":"src/index.ts","gameVersions":["1.26.65.1"],"name":"EffectFake","version":"1.0.0"}"#;
+
+    #[test]
+    fn effectfake_deploy_matches_enabled_toggle() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let source = d.path().join("EffectFake.mods");
+        create_mods_package(
+            &source,
+            None,
+            EFFECTFAKE_MANIFEST,
+            &[("src/index.ts", b"export default class EffectFake {}")],
+        );
+        assert_eq!(
+            import_mods_package_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Added
+        );
+        let id = s.library.lock().unwrap().mods[0].id.clone();
+        set_enabled_inner(id.clone(), true, &s).unwrap();
+        let deployed = g.join("mods").join("EffectFake");
+        assert_eq!(
+            read(deployed.join("manifest.json")).unwrap(),
+            EFFECTFAKE_MANIFEST.as_bytes().to_vec()
+        );
+        assert_eq!(
+            read(deployed.join("src/index.ts")).unwrap(),
+            b"export default class EffectFake {}".to_vec()
+        );
+        set_enabled_inner(id.clone(), false, &s).unwrap();
+        assert!(!deployed.exists());
+        set_enabled_inner(id, true, &s).unwrap();
+        assert!(deployed.join("manifest.json").is_file());
+    }
+
+    #[test]
+    fn ts_mods_deploy_to_registered_scriptclient_host_dir() {
+        let (d, s, g) = fixture();
+        install_loader_inner(&s).unwrap();
+        let host = d.path().join("ScriptClient.dll");
+        fs::write(&host, BRIDGE).unwrap();
+        import_mod_inner(host.display().to_string(), &s).unwrap();
+        let host_id = s.library.lock().unwrap().mods[0].id.clone();
+        set_enabled_inner(host_id.clone(), true, &s).unwrap();
+
+        let source = d.path().join("EffectFake.mods");
+        create_mods_package(
+            &source,
+            None,
+            EFFECTFAKE_MANIFEST,
+            &[("src/index.ts", b"export {};")],
+        );
+        import_mods_package_inner(source.display().to_string(), &s).unwrap();
+        let ts_id = s
+            .library
+            .lock()
+            .unwrap()
+            .mods
+            .iter()
+            .find(|m| m.kind == ModKind::Ts)
+            .unwrap()
+            .id
+            .clone();
+        set_enabled_inner(ts_id.clone(), true, &s).unwrap();
+
+        // ホスト DLL は PEXMods/<id> に配置され、そこ直下の mods/ を走査する。
+        let host_mods = g.join("PEXMods").join(&host_id).join("mods").join("EffectFake");
+        assert!(host_mods.join("manifest.json").is_file());
+        assert_eq!(read(host_mods.join("src/index.ts")).unwrap(), b"export {};".to_vec());
+        assert!(!g.join("mods").join("EffectFake").exists());
+        set_enabled_inner(ts_id, false, &s).unwrap();
+        assert!(!host_mods.exists());
+    }
+
+    #[test]
+    fn exported_mods_package_roundtrips_through_import() {
+        let (d, s, _g) = fixture();
+        let source = d.path().join("EffectFake.mods");
+        create_mods_package(
+            &source,
+            Some("EffectFake"),
+            EFFECTFAKE_MANIFEST,
+            &[
+                ("src/index.ts", b"export {};"),
+                ("node_modules/@bedrock/sdk/index.js", b"module.exports={};"),
+            ],
+        );
+        assert_eq!(
+            import_mods_package_inner(source.display().to_string(), &s).unwrap(),
+            ImportOutcome::Added
+        );
+        let id = s.library.lock().unwrap().mods[0].id.clone();
+        let exported = d.path().join("exported.mods");
+        export_mods_package_inner(id.clone(), exported.display().to_string(), &s).unwrap();
+        {
+            let file = fs::File::open(&exported).unwrap();
+            let zip = zip::ZipArchive::new(file).unwrap();
+            assert!(zip.file_names().any(|n| n == "manifest.json"));
+            assert!(zip.file_names().any(|n| n == "src/index.ts"));
+            assert!(zip.file_names().any(|n| n == "node_modules/@bedrock/sdk/index.js"));
+        }
+        // 未登録の id では書き出せない。
+        assert!(export_mods_package_inner(
+            "unknown".into(),
+            d.path().join("bad.mods").display().to_string(),
+            &s
+        )
+        .is_err());
+
+        let (_d2, s2, _g2) = fixture();
+        assert_eq!(
+            import_mods_package_inner(exported.display().to_string(), &s2).unwrap(),
+            ImportOutcome::Added
+        );
+        {
+            let lib = s2.library.lock().unwrap();
+            assert_eq!(lib.mods[0].name, "EffectFake");
+            let manifest = lib.mods[0].manifest.as_ref().unwrap();
+            assert_eq!(manifest.version, "1.0.0");
+            assert_eq!(manifest.game_versions, vec!["1.26.65.1"]);
+        }
+        let id2 = s2.library.lock().unwrap().mods[0].id.clone();
+        assert_eq!(
+            read(s2.root.join("library").join(&id2).join("src/index.ts")).unwrap(),
+            b"export {};".to_vec()
+        );
+        assert!(s2.root.join("library").join(&id2).join("node_modules/@bedrock/sdk/index.js").is_file());
     }
 }

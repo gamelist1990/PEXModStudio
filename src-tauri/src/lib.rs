@@ -21,6 +21,8 @@ pub fn run() {
             snapshot,
             set_game_path,
             import_mod,
+            import_mods_package,
+            export_mods_package,
             set_enabled,
             set_mods_enabled,
             remove_mod,

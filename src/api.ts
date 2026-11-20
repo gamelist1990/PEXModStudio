@@ -1,4 +1,16 @@
 import { invoke, isTauri } from "@tauri-apps/api/core";
+export interface TsManifest {
+  name: string;
+  version: string;
+  apiVersion: string;
+  entry: string;
+  gameVersions: string[];
+  description: string;
+  author: string;
+}
+
+export type ModKind = "dll" | "ts";
+
 export interface Mod {
   id: string;
   name: string;
@@ -6,6 +18,8 @@ export interface Mod {
   sha256: string;
   size: number;
   enabled: boolean;
+  kind: ModKind;
+  manifest?: TsManifest;
 }
 export interface Snapshot {
   library: { gamePath: string; mods: Mod[] };
@@ -40,4 +54,16 @@ export async function getSnapshot(): Promise<Snapshot> {
 export async function command(name: string, args?: Record<string, unknown>) {
   if (!desktop) throw new Error("この操作は Windows アプリで利用できます。");
   return invoke(name, args);
+}
+
+export async function importModsPackage(
+  path: string,
+): Promise<"added" | "updated" | "unchanged"> {
+  if (!desktop) throw new Error("この操作は Windows アプリで利用できます。");
+  return invoke("import_mods_package", { path });
+}
+
+export async function exportModsPackage(id: string, path: string): Promise<void> {
+  if (!desktop) throw new Error("この操作は Windows アプリで利用できます。");
+  return invoke("export_mods_package", { id, path });
 }
