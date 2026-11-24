@@ -9,6 +9,7 @@ use sysinfo::{ProcessesToUpdate, System};
 use uuid::Uuid;
 type Result<T> = std::result::Result<T, String>;
 const MARKER: &str = ".pex-mod-studio.json";
+const TS_OWNER: &str = ".pex-studio-owner";
 const PROXY: &[u8] = include_bytes!("../resources/winhttp.dll");
 const BRIDGE: &[u8] = include_bytes!("../resources/PEXModBridge.asi");
 const CONFIG: &[u8] = b"[GlobalSets]\r\nLoadPlugins=1\r\nDontLoadFromDllMain=1\r\nLoadFromScriptsOnly=1\r\nLoadRecursively=0\r\nLoadExtraPlugins=PEXMods\\PEXModBridge.asi\r\nDebugLog=1\r\n";
@@ -75,6 +76,7 @@ struct Owned {
 pub struct ManagerState {
     root: PathBuf,
     library: Mutex<Library>,
+    opened: Mutex<Vec<(String, bool)>>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,19 +175,32 @@ fn game(lib: &Library) -> Result<PathBuf> {
     }
     Ok(path)
 }
-/// Stage B ホスト（ScriptClient.dll）は自身の配置ディレクトリ直下の `mods/` を走査する
-/// (`mod_scanner.cpp` の `resolveModsDir`)。Studio が ScriptClient.dll を扱う経路は DLL Mod
-/// としての import のみで、その配置先は `Content/PEXMods/<id>/` である。ホストが登録されて
-/// いる場合はその直下の `mods/` に TS Mod を配置し、それ以外は従来どおり `Content/mods/`
-/// を使う（Content 直下に注入されたホストにも対応）。
-fn ts_mods_dir(lib: &Library, game: &Path) -> PathBuf {
-    lib.mods
+fn scriptclient_root(lib: &Library, game: &Path) -> Result<PathBuf> {
+    if tempfile::tempdir_in(game)
+        .and_then(|probe| fs::write(probe.path().join("probe"), b"1"))
+        .is_ok()
+    {
+        return Ok(game.to_owned());
+    }
+    let dir = lib.mods
         .iter()
         .find(|m| {
-            m.kind == ModKind::Dll && m.filename.eq_ignore_ascii_case("ScriptClient.dll")
+            m.enabled && m.kind == ModKind::Dll && m.filename.eq_ignore_ascii_case("ScriptClient.dll")
         })
-        .map(|m| game.join("PEXMods").join(&m.id).join("mods"))
-        .unwrap_or_else(|| game.join("mods"))
+        .map(|m| game.join("PEXMods").join(&m.id))
+        .filter(|dir| dir.join("ScriptClient.dll").is_file())
+        .ok_or("Minecraft の EXE フォルダに書き込めず、Studio 管理の ScriptClient DLL も見つかりません。")?;
+    Ok(dir)
+}
+
+fn remove_owned_ts(dir: &Path, id: &str) -> Result<bool> {
+    if !dir.symlink_metadata().is_ok_and(|m| m.is_dir()) ||
+        !fs::read_to_string(dir.join(TS_OWNER)).is_ok_and(|owner| owner == id)
+    {
+        return Ok(false);
+    }
+    fs::remove_dir_all(dir).map_err(err)?;
+    Ok(true)
 }
 fn owned(game: &Path) -> Result<Owned> {
     serde_json::from_slice(&read(game.join(MARKER))?).map_err(err)
@@ -270,6 +285,7 @@ impl ManagerState {
         Ok(Self {
             root,
             library: Mutex::new(library),
+            opened: Mutex::new(Vec::new()),
         })
     }
     fn save(&self, lib: &Library) -> Result<()> {
@@ -284,14 +300,12 @@ impl ManagerState {
         }
         let g = game(lib)?;
         verify_owned(&g, &owned(&g)?)?;
-        let ts_dir = ts_mods_dir(lib, &g);
+        let ts_dir = g.join("mods");
         // ホストは配置先フォルダを直接走査するため、無効化された TS Mod の
         // フォルダが残ると無効なままロードされてしまう。必ず有効なものだけ残す。
         for m in lib.mods.iter().filter(|m| m.kind == ModKind::Ts && !m.enabled) {
             let stale = ts_dir.join(&m.name);
-            if stale.exists() {
-                fs::remove_dir_all(&stale).map_err(err)?;
-            }
+            remove_owned_ts(&stale, &m.id)?;
         }
         let mut manifest = String::new();
         for m in lib.mods.iter().filter(|m| m.enabled) {
@@ -309,12 +323,15 @@ impl ManagerState {
                 ModKind::Ts => {
                     let source = self.root.join("library").join(&m.id);
                     let target = ts_dir.join(&m.name);
-                    // 更新時に古いファイルが残らないよう、配置先を作り直す。
-                    if target.exists() {
-                        fs::remove_dir_all(&target).map_err(err)?;
+                    // Do not overwrite ScriptClient-installed or manually placed mods.
+                    if target.symlink_metadata().is_ok() && !remove_owned_ts(&target, &m.id)? {
+                        return Err(format!("{}: mods/ に Studio 管理外の同名 Mod があります。", m.name));
                     }
                     fs::create_dir_all(&target).map_err(err)?;
-                    copy_dir(&source, &target)?;
+                    if let Err(e) = copy_dir(&source, &target).and_then(|()| write(target.join(TS_OWNER), m.id.as_bytes())) {
+                        let _ = fs::remove_dir_all(&target);
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -692,6 +709,95 @@ fn import_mods_package_inner(path: String, state: &ManagerState) -> Result<Impor
     Ok(ImportOutcome::Added)
 }
 
+// A marker distinguishes these carriers from the existing Studio library ZIP.
+// ScriptClient validates and extracts the body after explicit in-game approval.
+fn is_scriptclient_package(bytes: &[u8]) -> Result<bool> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(err)?;
+    let Ok(marker) = archive.by_name("scriptclient-package.json") else {
+        return Ok(false);
+    };
+    if !marker.is_file() || marker.size() > 4096 {
+        return Err("Invalid ScriptClient package marker".into());
+    }
+    let mut data = Vec::new();
+    marker.take(4097).read_to_end(&mut data).map_err(err)?;
+    let value: serde_json::Value = serde_json::from_slice(&data).map_err(err)?;
+    if value != serde_json::json!({"format":"scriptclient-mod","version":1}) {
+        return Err("Unsupported ScriptClient package format".into());
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn stage_scriptclient_package(path: String, state: tauri::State<ManagerState>) -> Result<Option<String>> {
+    stage_scriptclient_inner(Path::new(&path), &state)
+}
+
+fn stage_scriptclient_inner(path: &Path, state: &ManagerState) -> Result<Option<String>> {
+    use std::io::{Read, Write};
+    const LIMIT: u64 = 32 * 1024 * 1024;
+    let ext = path.extension().ok_or("Select a .mods or .zip package")?;
+    if !ext.eq_ignore_ascii_case("mods") && !ext.eq_ignore_ascii_case("zip") {
+        return Err("Select a .mods or .zip package".into());
+    }
+    let source = fs::File::open(path).map_err(err)?;
+    if !source.metadata().map_err(err)?.is_file() {
+        return Err("Select a regular package file".into());
+    }
+    let mut bytes = Vec::new();
+    // Legacy .mods files are not limited by the ScriptClient format.
+    if source.metadata().map_err(err)?.len() > LIMIT && ext.eq_ignore_ascii_case("mods") {
+        let mut archive = zip::ZipArchive::new(source).map_err(err)?;
+        if archive.by_name("scriptclient-package.json").is_err() {
+            return Ok(None);
+        }
+        return Err("ScriptClient package exceeds 32 MiB".into());
+    }
+    source.take(LIMIT + 1).read_to_end(&mut bytes).map_err(err)?;
+    if bytes.len() as u64 > LIMIT {
+        return Err("ScriptClient package exceeds 32 MiB".into());
+    }
+    if !is_scriptclient_package(&bytes)? {
+        return if ext.eq_ignore_ascii_case("mods") { Ok(None) }
+            else { Err("ZIP is missing the ScriptClient package marker".into()) };
+    }
+    let lib = state.library.lock().map_err(err)?;
+    let root = scriptclient_root(&lib, &game(&lib)?)?;
+    let inbox = root.join("packages");
+    fs::create_dir_all(&inbox).map_err(err)?;
+    let dest = inbox.join(path.file_name().ok_or("Invalid package filename")?);
+    if path.canonicalize().ok().is_some_and(|source| dest.canonicalize().ok() == Some(source)) {
+        return Ok(Some(dest.display().to_string()));
+    }
+    let mut staged = tempfile::NamedTempFile::new_in(&inbox).map_err(err)?;
+    staged.write_all(&bytes).map_err(err)?;
+    staged.as_file().sync_all().map_err(err)?;
+    staged.persist_noclobber(&dest).map_err(err)?;
+    Ok(Some(dest.display().to_string()))
+}
+
+pub fn open_package_args(state: &ManagerState, args: impl IntoIterator<Item = PathBuf>) {
+    for path in args {
+        if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("mods") || ext.eq_ignore_ascii_case("zip")) {
+            continue;
+        }
+        let outcome = stage_scriptclient_inner(&path, state).and_then(|staged| match staged {
+            Some(path) => Ok(format!("Mod Manager でインストールしてください: {path}")),
+            None => import_mods_package_inner(path.to_string_lossy().into_owned(), state)
+                .map(|_| format!("Studio ライブラリ: {}", path.display())),
+        });
+        if let Ok(mut opened) = state.opened.lock() {
+            opened.push(match outcome { Ok(msg) => (msg, false), Err(e) => (e, true) });
+        }
+    }
+}
+
+#[tauri::command]
+pub fn take_opened_packages(state: tauri::State<ManagerState>) -> Result<Vec<(String, bool)>> {
+    Ok(std::mem::take(&mut *state.opened.lock().map_err(err)?))
+}
+
 #[tauri::command]
 pub fn export_mods_package(
     id: String,
@@ -916,7 +1022,7 @@ fn remove_mods_inner(ids: Vec<String>, state: &ManagerState) -> Result<()> {
     // ホスト DLL と TS Mod を同時削除しても配置先を解決できるよう、commit 前に計算する。
     let game_dirs = game(&lib)
         .ok()
-        .map(|g| (g.clone(), ts_mods_dir(&lib, &g)));
+        .map(|g| (g.clone(), g.join("mods")));
     state.commit(&mut lib, next)?;
     let mut errors = vec![];
     for m in selected {
@@ -924,7 +1030,11 @@ fn remove_mods_inner(ids: Vec<String>, state: &ManagerState) -> Result<()> {
         if let Some((g, ts_dir)) = &game_dirs {
             match m.kind {
                 ModKind::Dll => dirs.push(g.join("PEXMods").join(&m.id)),
-                ModKind::Ts => dirs.push(ts_dir.join(&m.name)),
+                ModKind::Ts => {
+                    if let Err(e) = remove_owned_ts(&ts_dir.join(&m.name), &m.id) {
+                        errors.push(format!("{}: {e}", m.name));
+                    }
+                }
             }
         }
         for dir in dirs {
@@ -1104,7 +1214,7 @@ pub fn open_folder(kind: String, state: tauri::State<ManagerState>) -> Result<()
         "library" => state.root.join("library"),
         "mods" => {
             let g = game(&lib)?;
-            ts_mods_dir(&lib, &g)
+            scriptclient_root(&lib, &g)?.join("mods")
         }
         "game" => game(&lib)?,
         _ => return Err("Unknown folder".into()),
@@ -1579,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn ts_mods_deploy_to_registered_scriptclient_host_dir() {
+    fn ts_mods_deploy_to_game_directory_without_overwriting_unknown_mods() {
         let (d, s, g) = fixture();
         install_loader_inner(&s).unwrap();
         let host = d.path().join("ScriptClient.dll");
@@ -1608,13 +1718,46 @@ mod tests {
             .clone();
         set_enabled_inner(ts_id.clone(), true, &s).unwrap();
 
-        // ホスト DLL は PEXMods/<id> に配置され、そこ直下の mods/ を走査する。
-        let host_mods = g.join("PEXMods").join(&host_id).join("mods").join("EffectFake");
-        assert!(host_mods.join("manifest.json").is_file());
-        assert_eq!(read(host_mods.join("src/index.ts")).unwrap(), b"export {};".to_vec());
-        assert!(!g.join("mods").join("EffectFake").exists());
-        set_enabled_inner(ts_id, false, &s).unwrap();
-        assert!(!host_mods.exists());
+        let target = g.join("mods").join("EffectFake");
+        assert!(target.join("manifest.json").is_file());
+        assert_eq!(read(target.join("src/index.ts")).unwrap(), b"export {};".to_vec());
+        assert!(!g.join("PEXMods").join(&host_id).join("mods").exists());
+        set_enabled_inner(ts_id.clone(), false, &s).unwrap();
+        assert!(!target.exists());
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("sentinel"), "manual mod").unwrap();
+        assert!(set_enabled_inner(ts_id, true, &s).is_err());
+        assert_eq!(read(target.join("sentinel")).unwrap(), b"manual mod");
+    }
+
+    #[test]
+    fn scriptclient_file_open_stages_without_deploying_and_preserves_legacy_intake() {
+        use std::io::Write;
+        let (d, s, g) = fixture();
+        let source = d.path().join("Test Package.mods");
+        let mut zip = zip::ZipWriter::new(fs::File::create(&source).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, content) in [
+            ("scriptclient-package.json", r#"{"format":"scriptclient-mod","version":1}"#),
+            ("mod/manifest.json", EFFECTFAKE_MANIFEST),
+            ("mod/src/index.ts", "export {};"),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(content.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        open_package_args(&s, [source.clone()]);
+        let target = g.join("packages").join(source.file_name().unwrap());
+        assert_eq!(read(&target).unwrap(), read(&source).unwrap());
+        assert!(!g.join("mods").exists());
+        assert!(s.library.lock().unwrap().mods.is_empty());
+        assert!(!s.opened.lock().unwrap()[0].1);
+        assert!(stage_scriptclient_inner(&source, &s).is_err()); // no overwrite
+        let legacy = d.path().join("legacy.mods");
+        create_mods_package(&legacy, None, EFFECTFAKE_MANIFEST, &[("src/index.ts", b"export {};")]);
+        assert_eq!(stage_scriptclient_inner(&legacy, &s).unwrap(), None);
+        open_package_args(&s, [legacy]);
+        assert_eq!(s.library.lock().unwrap().mods.len(), 1);
     }
 
     #[test]

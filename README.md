@@ -54,6 +54,12 @@ Content/
 
 ライブラリは `%LOCALAPPDATA%\com.pexserver.modstudio\library`、設定は同じ場所の `library.json` に保存します。DLL の元ファイルは変更しません。
 
+### ScriptClient パッケージ
+
+Studio をインストール後、ScriptClient 用の `.mods` はダブルクリックで開けます。`.zip` は Studio のファイル選択またはドラッグ＆ドロップで開きます。`scriptclient-package.json` で識別されたパッケージはライブラリではなく、Minecraft の EXE があるフォルダーの `packages/` に入ります。ゲーム内で **設定 → Mod Menu → Mod Manager → Install …** を実行してください。旧 `.mods` は引き続き Studio ライブラリに追加されます。
+
+[パッケージ作成方法・配置先](https://gamelist1990.github.io/BedrockDynamicSDK/scriptclient/)
+
 `LOADED` は Windows が DLL をロードしたことを示します。DLL が狙うゲームのシンボル、フック、動作の互換性までは検証しません。初期化中にプロセスが終了した DLL は次の起動でスキップし、`blocked.txt` に保持します。修正済み DLL を再取り込みするか、いったん無効にして再度有効にすると再試行できます。初期化後のゲームプレイ中のクラッシュは自動特定できません。
 
 既存の `winhttp.dll`・設定ファイルとは自動で共存しません。衝突を表示し、上書きを止めます。自分が導入したローダーも SHA-256 が変更されている場合は上書き・削除しません。欠けた管理対象ファイルは「構成を確認・同期」で修復できます。同時に別のツールでローダーを変更しないでください。

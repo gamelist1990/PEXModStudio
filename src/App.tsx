@@ -58,7 +58,19 @@ export default function App() {
   };
   useEffect(() => {
     void refresh();
-    const t = setInterval(() => void refresh(), 5000);
+    const takeOpened = async () => {
+      if (!desktop) return;
+      try {
+        const outcomes = await command<[string, boolean][]>("take_opened_packages");
+        if (outcomes.length)
+          setNotice({ text: outcomes.map(([text]) => text).join(" / "),
+            error: outcomes.some(([, error]) => error) });
+      } catch (e) {
+        setNotice({ text: String(e), error: true });
+      }
+    };
+    void takeOpened();
+    const t = setInterval(() => { void refresh(); void takeOpened(); }, 5000);
     return () => clearInterval(t);
   }, []);
   const action = async (
@@ -84,11 +96,9 @@ export default function App() {
   };
   const importPaths = async (paths: string[]) => {
     if (!paths.length) return;
-    if (working.current || data?.running || remove) {
+    if (working.current || remove) {
       setNotice({
-        text: data?.running
-          ? "Minecraft を終了してから Mod を追加してください。"
-          : remove
+        text: remove
             ? "削除の確認画面を閉じてから Mod を追加してください。"
             : "現在の処理が完了してから Mod を追加してください。",
         error: true,
@@ -102,7 +112,7 @@ export default function App() {
         p.toLowerCase().endsWith(".dll"),
       );
       const modsPaths = paths.filter((p) =>
-        p.toLowerCase().endsWith(".mods"),
+        /\.(mods|zip)$/i.test(p),
       );
       const { count, updated, unchanged, errors } = await importDllPaths(
         dllPaths,
@@ -112,8 +122,11 @@ export default function App() {
       let tsUpdated = 0;
       let tsUnchanged = 0;
       const tsErrors: string[] = [];
+      const staged: string[] = [];
       for (const path of modsPaths) {
         try {
+          const destination = await command<string | null>("stage_scriptclient_package", { path });
+          if (destination) { staged.push(destination); continue; }
           const outcome = await importModsPackage(path);
           if (outcome === "updated") tsUpdated++;
           else if (outcome === "unchanged") tsUnchanged++;
@@ -133,7 +146,7 @@ export default function App() {
       const totalUnchanged = unchanged + tsUnchanged;
       const totalErrors = [...errors, ...tsErrors];
       setNotice({
-        text: `${totalCount} 件追加・${totalUpdated} 件更新・${totalUnchanged} 件変更なし。${totalErrors.join(" / ")}`,
+        text: `${totalCount} 件追加・${totalUpdated} 件更新・${totalUnchanged} 件変更なし。${staged.length ? ` Mod Manager でインストールしてください: ${staged.join(" / ")}。` : ""}${totalErrors.join(" / ")}`,
         error: totalErrors.length > 0,
       });
     } catch (e) {
@@ -190,7 +203,7 @@ export default function App() {
   const addMods = async () => {
     if (!desktop) {
       setNotice({
-        text: ".mods の追加は Windows アプリで利用できます。",
+        text: ".mods / .zip の追加は Windows アプリで利用できます。",
         error: true,
       });
       return;
@@ -202,7 +215,7 @@ export default function App() {
     try {
       files = await open({
         multiple: true,
-        filters: [{ name: "PEX Mod Package", extensions: ["mods"] }],
+        filters: [{ name: "PEX Mod Package", extensions: ["mods", "zip"] }],
       });
     } catch (e) {
       setNotice({ text: String(e), error: true });
@@ -580,11 +593,11 @@ export default function App() {
                     </button>
                     <button
                       className="secondary"
-                      disabled={locked}
+                      disabled={busy || !!remove}
                       onClick={() => void addMods()}
                     >
                       <Plus size={18} />
-                      .mods を追加
+                      .mods / .zip を追加
                     </button>
                   </div>
                 </div>

@@ -51,9 +51,9 @@ export async function getSnapshot(): Promise<Snapshot> {
     };
   return invoke("snapshot");
 }
-export async function command(name: string, args?: Record<string, unknown>) {
+export async function command<T = unknown>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!desktop) throw new Error("この操作は Windows アプリで利用できます。");
-  return invoke(name, args);
+  return invoke<T>(name, args);
 }
 
 export async function importModsPackage(
