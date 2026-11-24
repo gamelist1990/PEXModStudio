@@ -93,7 +93,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-bridge.ps1
 npm run tauri build -- --bundles nsis
 ```
 
-`scripts/prepare-native.ps1` は GitHub の固定アセット ID `662745698` を取得し、アーカイブの SHA-256 `422645c19da0cc5904170c81903a5a9c9a1384131496a295de870c8c1789f5be` を照合します。moving tag をビルドごとに追従しません。ブリッジは `native/` の Rust ソースからビルドします。生成したローダーはアプリ内へ埋め込み、アプリ利用時のダウンロードは不要です。
+`scripts/prepare-native.ps1` は v10.0.0 の `Ultimate-ASI-Loader-NoPDB_x64.zip` を取得し、SHA-256 `3385950d6af79257d18420b1d6904bc47480170b3dabe345f8c1339d0a49183f` を照合します。同梱の汎用プロキシ DLL を `winhttp.dll` として配置します。ブリッジは `native/` の Rust ソースからビルドします。生成したローダーはアプリ内へ埋め込み、アプリ利用時のダウンロードは不要です。
 
 UI だけの確認は `npm run dev`。ブラウザでは実際のゲームを検出したようには表示せず、プレビューであることを明示します。
 
